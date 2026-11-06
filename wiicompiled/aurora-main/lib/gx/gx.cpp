@@ -1334,7 +1334,7 @@ void clear_display_copy_cache() noexcept {
   g_gxState.displayCopyHeight = 0;
 }
 
-void set_display_copy_present_source() noexcept {
+void set_display_copy_present_source(std::array<float, 4> efbRect) noexcept {
   if (!g_gxState.displayCopyTexture) {
     return;
   }
@@ -1342,7 +1342,8 @@ void set_display_copy_present_source() noexcept {
   g_gxState.displayCopyBindGroup = webgpu::create_copy_bind_group(g_gxState.displayCopyTexture->sampleTextureView,
                                                                   webgpu::present_source().sampler);
   webgpu::set_present_source_override(g_gxState.displayCopyBindGroup, g_gxState.displayCopyTexture->texture,
-                                      g_gxState.displayCopyTexture->size, g_gxState.displayCopyTexture->format);
+                                      g_gxState.displayCopyTexture->size, g_gxState.displayCopyTexture->format,
+                                      efbRect);
 }
 
 void evict_copy_texture(const void* dest) noexcept {
@@ -1725,6 +1726,42 @@ static inline wgpu::CompareFunction to_compare_function(GXCompare func) {
   }
 }
 
+// Motion vectors: written by surfaces that own their pixel: color-writing draws that either write depth through a
+// real depth test, or are opaque without writing depth (sky, opaque HUD). Transparent effects that write no depth
+// leave the motion of what is behind them, and so do depth-only draws and the screen quad the game clears depth
+// with before its HUD (depth test "always"), which would otherwise give the whole scene the quad's motion.
+// Blending with source ONE and destination ZERO replaces the color: opaque, like no blending (the game clears with it).
+static bool motion_opaque(const PipelineConfig& config) noexcept {
+  return config.blendMode == GX_BM_NONE ||
+         (config.blendMode == GX_BM_BLEND && config.blendFacSrc == GX_BL_ONE && config.blendFacDst == GX_BL_ZERO);
+}
+static bool motion_owner(const PipelineConfig& config) noexcept {
+  return config.colorUpdate && (config.depthUpdate ? config.depthFunc != GX_ALWAYS : motion_opaque(config));
+}
+// An alpha-blended surface that writes depth (an occluder the game fades out in front of the camera, a shadow quad)
+// owns only the pixels where it is at least half opaque.
+static bool motion_alpha_blended(const PipelineConfig& config) noexcept {
+  return config.blendMode == GX_BM_BLEND && config.blendFacSrc == GX_BL_SRCALPHA;
+}
+// The draw's MotionRole (see gx.hpp).
+static u8 motion_role(const PipelineConfig& config, GXProjectionType projType) noexcept {
+  if (!config.colorUpdate) {
+    return MotionRoleOwner;  // writes no color: nothing visible (it may not even own: see motion_owner)
+  }
+  if (projType == GX_ORTHOGRAPHIC) {
+    // A full-screen 2D quad writing depth with the test "always" is how the game clears the EFB at the start of a frame
+    // (and its depth before the HUD): a clear, not part of the 2D layer.
+    if (config.depthUpdate && config.depthFunc == GX_ALWAYS) {
+      return MotionRoleOwner;
+    }
+    return MotionRoleLayer2D;
+  }
+  if (motion_owner(config)) {
+    return motion_alpha_blended(config) ? MotionRoleAlphaOwned : MotionRoleOwner;
+  }
+  return motion_opaque(config) ? MotionRoleOwner : MotionRoleTransparent;
+}
+
 static inline wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendFactor dstFac,
                                               GXLogicOp op, GXPixelFmt pixelFmt, u32 dstAlpha) {
   wgpu::BlendComponent colorBlendComponent;
@@ -1891,15 +1928,75 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
   };
   const auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
                                          config.pixelFmt, config.dstAlpha);
-  const std::array colorTargets{wgpu::ColorTargetState{
-      .format = g_graphicsConfig.surfaceConfiguration.format,
-      .blend = &blendState,
-      .writeMask = to_write_mask(config.colorUpdate, config.alphaUpdate),
-  }};
+  // Motion vectors (see motion_owner / motion_role). An alpha-owned surface's shader gives its motion alpha 0 or 1
+  // (at least half opaque), so motionSelect picks one of the two vectors, never a mix.
+  // 2D draws are not scene surfaces: the HUD has its mark, and a copy of the scene drawn back over it (the game's
+  // mist and glow effects paste part of the frame back) shows the scene, which keeps its own motion and depth.
+  const u8 role = config.shaderConfig.motionRole;
+  const bool writesMotion = motion_owner(config) && role != MotionRoleLayer2D;
+  const bool alphaOwned = motion_alpha_blended(config);
+  // The HUD mark: set by the draws the seal flags as the HUD, cleared under anything else drawn visibly (see the
+  // shader); weighted by the shader's alpha, like motionSelect.
+  const bool writesMark = role == MotionRoleLayer2D || writesMotion || role == MotionRoleTransparent;
+  const bool writesTransparency = (writesMotion && role != MotionRoleLayer2D) || role == MotionRoleTransparent;
+  // Transparency target, "over": rgb = src.rgb * w + previous * (1 - w), w = the shader's alpha. Transparent layers
+  // add (motion * coverage, coverage) this way; an owner writes w = 1 with zeros, clearing what was behind it.
+  constexpr wgpu::BlendState transparencyBlend{
+      .color = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::SrcAlpha,
+                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha},
+      .alpha = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::One},
+  };
+  constexpr wgpu::BlendState motionSelect{
+      .color = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::SrcAlpha,
+                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha},
+      .alpha = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::One},
+  };
+  const std::array colorTargets{
+      wgpu::ColorTargetState{
+          .format = g_graphicsConfig.surfaceConfiguration.format,
+          .blend = &blendState,
+          .writeMask = to_write_mask(config.colorUpdate, config.alphaUpdate),
+      },
+      wgpu::ColorTargetState{
+          .format = wgpu::TextureFormat::RG16Float,
+          .blend = writesMotion && alphaOwned ? &motionSelect : nullptr,
+          .writeMask = writesMotion ? wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green
+                                    : wgpu::ColorWriteMask::None,
+      },
+      // The owning surface's depth now and last frame, under the same rules (an alpha-owned one needs a blendable
+      // 32-bit float target).
+      wgpu::ColorTargetState{
+          .format = wgpu::TextureFormat::RG32Float,
+          .blend = writesMotion && alphaOwned ? &motionSelect : nullptr,
+          .writeMask = writesMotion && (!alphaOwned || webgpu::g_float32Blendable)
+                           ? wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green
+                           : wgpu::ColorWriteMask::None,
+      },
+      // The HUD's "use the current frame" mark.
+      wgpu::ColorTargetState{
+          .format = wgpu::TextureFormat::R8Unorm,
+          .blend = alphaOwned || role == MotionRoleTransparent || role == MotionRoleLayer2D ? &motionSelect : nullptr,
+          .writeMask = writesMark ? wgpu::ColorWriteMask::Red : wgpu::ColorWriteMask::None,
+      },
+      // Transparent layers' motion (x, y, weighted by coverage) and coverage (z).
+      wgpu::ColorTargetState{
+          .format = wgpu::TextureFormat::RGBA16Float,
+          .blend = &transparencyBlend,
+          .writeMask = writesTransparency
+                           ? wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue
+                           : wgpu::ColorWriteMask::None,
+      },
+  };
   const wgpu::FragmentState fragmentState{
       .module = shader,
       .entryPoint = "fs_main",
-      .targetCount = colorTargets.size(),
+      .targetCount = config.shaderConfig.motionVectors ? colorTargets.size() : 1,
       .targets = colorTargets.data(),
   };
   const wgpu::RenderPipelineDescriptor descriptor{
@@ -2099,6 +2196,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   config.shaderConfig.tevStageCount = g_gxState.numTevStages;
   config.shaderConfig.numTexGens = g_gxState.numTexGens;
   config.shaderConfig.zFreeze = g_gxState.zFreeze && g_gxState.zFreezePlane.w() != 0.f;
+  config.shaderConfig.motionVectors = gfx::motion_vectors_active();
   if (g_gxState.zTextureOp != GX_ZT_DISABLE && !g_gxState.zCompLocBeforeTex) {
     config.shaderConfig.zTexture = (g_gxState.zTextureBias & 0x00FFFFFFu) |
                                     ((static_cast<u32>(g_gxState.zTextureFmt) & 0x3u) << 24) |
@@ -2145,6 +2243,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   config.depthUpdate = g_gxState.depthCompare && g_gxState.depthUpdate;
   config.alphaUpdate = effective_alpha_update(g_gxState.pixelFmt, g_gxState.alphaUpdate);
   config.colorUpdate = g_gxState.colorUpdate;
+  config.shaderConfig.motionRole = config.shaderConfig.motionVectors ? motion_role(config, g_gxState.projType) : 0;
 }
 
 // Cut-outs: materials like leaves, grass and webs are drawn with alpha compare "alpha > 0" (or another low ref),

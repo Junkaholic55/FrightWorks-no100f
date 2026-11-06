@@ -501,6 +501,22 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.zFreeze = true;
     info.uniformSize += sizeof(Vec4<float>);
   }
+  // Motion vectors: last frame's viewport rect, projection and position matrices, last in the block. A
+  // draw whose block would outgrow the limit writes zero motion instead.
+  if (config.motionVectors && config.lineMode == 0) {
+    const u32 offset = (info.uniformSize + 15u) & ~15u;
+    // viewport, previous-position array (offset, valid), projection, position matrices
+    const u32 end = offset + sizeof(Vec4<float>) + sizeof(Vec4<u32>) + sizeof(Mat4x4<float>) +
+                    sizeof(Mat3x4<float>) * info.matrixLayout.postexCount;
+    if (gfx::align_uniform(end) <= MaxUniformSize) {
+      info.motionPrev = true;
+      info.motionPrevOffset = offset;
+      info.uniformSize = end;
+    } else if (std::getenv("AURORA_MV_LOG") != nullptr) {
+      std::fprintf(stderr, "[mv] shader without motion block: uniform %u + block -> %u > %u\n", info.uniformSize,
+                   gfx::align_uniform(end), MaxUniformSize);
+    }
+  }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
@@ -572,6 +588,23 @@ static Mat4x4<float> effective_projection() noexcept {
   return proj;
 }
 } // namespace
+
+// AURORA_MV_LOG: once a second, how many perspective draws had no motion block and why.
+static bool config_motion_draw_log(const ShaderInfo& info, const uint8_t* motionPrevData) {
+  static uint32_t total = 0, without = 0, lines = 0, frame = 0;
+  ++total;
+  if (motionPrevData == nullptr) {
+    ++without;
+    if (info.lineMode != 0) ++lines;
+  }
+  const uint32_t now = gfx::current_frame();
+  if (now / 60 != frame / 60) {
+    std::fprintf(stderr, "[mv] perspective draws %u without motion block %u (lines/points %u)\n", total, without, lines);
+    total = without = lines = 0;
+  }
+  frame = now;
+  return false;
+}
 
 UniformRanges build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRanges& ranges,
                             const FrameInterpolationDrawIdentity& drawIdentity, bool perspective,
@@ -731,8 +764,46 @@ UniformRanges build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGrou
     const auto& p = g_gxState.zFreezePlane;
     buf.append(flip ? Vec4<float>{-p.x(), -p.y(), -p.z(), 0.f} : Vec4<float>{p.x(), p.y(), p.z() + 1.f, 0.f});
   }
+  // Motion vectors: the render viewport, then "last frame's" projection and position matrices, staged as this
+  // frame's so the draw has no motion unless frame interpolation's pairing replaces them at seal.
+  uint8_t* motionPrevData = nullptr;
+  if (info.motionPrev) {
+    if (buf.size() < info.motionPrevOffset) {
+      buf.append_zeroes(info.motionPrevOffset - buf.size());
+    }
+    motionPrevData = buf.data() + buf.size();
+    const auto& vp = g_gxState.renderViewport;
+    buf.append(Vec4<float>{vp.left, vp.top, vp.width, vp.height});
+    // x, y: previous-position array, set by vertex history (frame_interpolation.cpp); z, w: the viewport's depth range
+    // as the depth buffer stores it (float bits), to put last frame's clip depth in the same terms.
+    const float minDepth = UseReversedZ ? 1.0f - vp.zfar : vp.znear;
+    const float maxDepth = UseReversedZ ? 1.0f - vp.znear : vp.zfar;
+    u32 minBits, maxBits;
+    std::memcpy(&minBits, &minDepth, sizeof(minBits));
+    std::memcpy(&maxBits, &maxDepth, sizeof(maxBits));
+    buf.append(Vec4<u32>{0, 0, minBits, maxBits});
+    buf.append(effectiveProj);
+    buf.append(staged.data() + positionOffset, sizeof(Mat3x4<float>) * layout.postexCount);
+    // Debug view (AURORA_MV_MARK_UNPAIRED=1): start every draw far from where it is, so a draw the pairing never
+    // reaches shows as huge motion in the dump instead of looking still.
+    static const bool markUnpaired = std::getenv("AURORA_MV_MARK_UNPAIRED") != nullptr;
+    if (markUnpaired) {
+      auto* matrices = reinterpret_cast<float*>(motionPrevData + sizeof(Vec4<float>) + sizeof(Vec4<u32>) +
+                                                sizeof(Mat4x4<float>));
+      for (u32 m = 0; m < layout.postexCount; ++m) {
+        matrices[m * 12 + 3] += 1000.f;
+      }
+    }
+  }
 
-  if (!perspective || frame_interpolation_fps() == 0) {
+  if (std::getenv("AURORA_MV_LOG") != nullptr && perspective && config_motion_draw_log(info, motionPrevData)) {
+  }
+  if (motionPrevData != nullptr) {
+    note_motion_draw(motionPrevData, perspective,
+                     g_gxState.projType == GX_ORTHOGRAPHIC && g_gxState.depthCompare && g_gxState.depthUpdate &&
+                         g_gxState.depthFunc == GX_ALWAYS);
+  }
+  if (!perspective || (frame_interpolation_fps() == 0 && motionPrevData == nullptr)) {
     g_gxState.stateDirty = false;
     return {
         .current = range,
@@ -753,6 +824,12 @@ UniformRanges build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGrou
                                ? std::min<size_t>(g_gxState.currentPnMtx, MaxPnMtx - 1)
                                : 0,
           .indexedMatrices = info.indexAttr.test(GX_VA_PNMTXIDX),
+          .motionPrevData = motionPrevData,
+          .posArrayData = motionPrevData != nullptr && (g_gxState.vtxDesc[GX_VA_POS] == GX_INDEX8 ||
+                                                        g_gxState.vtxDesc[GX_VA_POS] == GX_INDEX16)
+                              ? static_cast<const uint8_t*>(g_gxState.arrays[GX_VA_POS].data)
+                              : nullptr,
+          .posArraySize = g_gxState.arrays[GX_VA_POS].size,
       });
   g_gxState.stateDirty = false;
   return {

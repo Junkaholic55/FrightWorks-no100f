@@ -1086,6 +1086,36 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         "\n    let zf_ndc = out.pos.xy / out.pos.w;"
         "\n    out.pos.z = (ubuf.zfreeze_plane.x * zf_ndc.x + ubuf.zfreeze_plane.y * zf_ndc.y + ubuf.zfreeze_plane.z) * out.pos.w;";
   }
+  // Motion vectors: where this vertex was last frame, with last frame's matrices (build_uniform starts them as
+  // this frame's, so an unpaired draw has no motion; frame interpolation's pairing fills them at seal).
+  if (config.motionVectors) {
+    vtxOutAttrs += fmt::format("\n    @location({}) mv_prev_clip: vec4f,", vtxOutIdx++);
+    vtxOutAttrs += fmt::format("\n    @location({}) mv_cur_clip: vec4f,", vtxOutIdx++);
+    // This frame's position before the 7/12 pixel-center shift below, so both ends map the same way.
+    vtxXfrAttrsPre += "\n    out.mv_cur_clip = out.pos;";
+    if (info.motionPrev) {
+      // Vertex history: a CPU-animated model's previous positions come from last frame's copy of its POS array
+      // (same indices, mv_prev_pos.x = where the copy is, .y = whether there is one).
+      std::string prevPos = std::string(vtx_attr(config, GX_VA_POS));
+      const auto posType = config.attrs[GX_VA_POS].attrType;
+      if (config.lineMode == 0 && (posType == GX_INDEX8 || posType == GX_INDEX16)) {
+        std::string load = attr_load(config, GX_VA_POS, vidxAttr);
+        const std::string currentArray = fmt::format("ubuf.array_start[{}]", GX_VA_POS - GX_VA_POS);
+        for (size_t at = load.find(currentArray); at != std::string::npos; at = load.find(currentArray, at)) {
+          load.replace(at, currentArray.size(), "ubuf.mv_prev_pos.x");
+        }
+        vtxXfrAttrsPre += fmt::format("\n    var mv_prev_in_pos = {};"
+                                      "\n    if ((ubuf.mv_prev_pos.y & 1u) != 0u) {{ mv_prev_in_pos = {}; }}",
+                                      prevPos, load);
+        prevPos = "mv_prev_in_pos";
+      }
+      vtxXfrAttrsPre += fmt::format(
+          "\n    out.mv_prev_clip = vec4f(vec4f({}, 1.0) * ubuf.mv_prev_postex_mtx[in_pnmtxidx], 1.0) * ubuf.mv_prev_proj;",
+          prevPos);
+    } else {
+      vtxXfrAttrsPre += "\n    out.mv_prev_clip = vec4f(0.0);";
+    }
+  }
   // GX rasterizes at a 7/12 pixel center when antialiasing is disabled, while WebGPU rasterizes at 1/2.
   vtxXfrAttrsPre +=
       "\n    let gx_pixel_center_correction = "
@@ -1696,6 +1726,15 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         i, i * 2, i * 2 + 1);
   }
   if (config.zFreeze) uniBufAttrs += "\n    zfreeze_plane: vec4f,";  // last, matching build_uniform
+  if (info.motionPrev) {
+    // After everything else, matching build_uniform: the render viewport (x, y, width, height) and last
+    // frame's projection and position matrices.
+    uniBufAttrs += fmt::format("\n    mv_viewport: vec4f,"
+                               "\n    mv_prev_pos: vec4u,"
+                               "\n    mv_prev_proj: mat4x4f,"
+                               "\n    mv_prev_postex_mtx: array<mat3x4f, {}>,",
+                               info.matrixLayout.postexCount);
+  }
   fragmentFn += "\n    prev = tev_overflow_vec4f(prev);";
   if (config.alphaCompare) {
     const auto comp0 = alpha_compare(config.alphaCompare.comp0, config.alphaCompare.ref0);
@@ -1730,7 +1769,83 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
 
   std::string fragmentReturnType = "@location(0) vec4f";
   std::string fragmentReturn = "    return prev;";
-  if (usesZTextureDepth) {
+  std::string motionReturn;
+  if (config.motionVectors) {
+    // Pixels from this fragment to where its surface was last frame (prev_pos = pos + motion), y down.
+    if (info.motionPrev) {
+      fragmentFn += "\n    var motion = vec2f(0.0);"
+                    "\n    if (in.mv_prev_clip.w > 1e-6 && in.mv_cur_clip.w > 1e-6) {"
+                    "\n        let prev_ndc = in.mv_prev_clip.xy / in.mv_prev_clip.w;"
+                    "\n        let cur_ndc = in.mv_cur_clip.xy / in.mv_cur_clip.w;"
+                    "\n        motion = (vec2f(prev_ndc.x, -prev_ndc.y) - vec2f(cur_ndc.x, -cur_ndc.y)) * 0.5 * ubuf.mv_viewport.zw;"
+                    "\n    }";
+    } else {
+      fragmentFn += "\n    let motion = vec2f(0.0);";
+    }
+    // Alpha: whether this pixel is at least half opaque. Alpha-blended draws use it to choose between their motion and
+    // what is already there (gx.cpp); other draws ignore it.
+    motionReturn = "    out.motion = vec4f(motion, 0.0, select(0.0, 1.0, prev.a >= 0.5));\n";
+    // The depth this fragment writes, as the depth buffer holds it, and this surface's depth last frame (same terms,
+    // through the viewport's depth range), for the motion-vector depth target.
+    const std::string depthNow = usesZTextureDepth ? "fragDepth" : "in.pos.z";
+    std::string depthBefore = depthNow;
+    if (info.motionPrev) {
+      depthBefore = fmt::format(
+          "select({0}, mix(bitcast<f32>(ubuf.mv_prev_pos.z), bitcast<f32>(ubuf.mv_prev_pos.w), "
+          "in.mv_prev_clip.z / in.mv_prev_clip.w), in.mv_prev_clip.w > 1e-6)",
+          depthNow);
+    }
+    motionReturn += fmt::format("    out.motion_depth = vec4f({}, {}, 0.0, out.motion.a);\n", depthNow, depthBefore);
+    // The 2D layer's mark, and the transparency target's (motion * coverage, coverage, weight) (see MotionRole).
+    // The HUD's mark: the draws after the game's last depth clear (flagged at seal, mv_prev_pos.y bit 1) mark what
+    // they draw. Any other draw clears it under what it draws (2D before the HUD is a background or scratch work).
+    const std::string hud = info.motionPrev ? "(ubuf.mv_prev_pos.y & 2u) != 0u" : "false";
+    if (config.motionRole == MotionRoleLayer2D || config.motionRole == MotionRoleTransparent) {
+      motionReturn += fmt::format("    out.motion_mark = select(vec4f(0.0), vec4f(select(0.0, 1.0, {}), 0.0, 0.0, 1.0), "
+                                  "prev.a > 0.02);\n",
+                                  hud);
+    } else {
+      motionReturn += fmt::format("    out.motion_mark = select(vec4f(0.0, 0.0, 0.0, out.motion.a), vec4f(1.0), {});\n",
+                                  hud);
+    }
+    // Only layers solid enough to leave a visible trail count: the game's soft mist sheets drift over everything while
+    // the camera moves, and masking them would throw away the history of the whole picture behind them.
+    static const float minCoverage = [] {
+      const char* env = std::getenv("AURORA_MV_TRANSPARENCY_MIN");
+      return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.f, 1.f) : 0.35f;
+    }();
+    const std::string coverage =
+        fmt::format("    let coverage = select(0.0, clamp(prev.a, 0.0, 1.0), prev.a >= {:.3f});\n", minCoverage);
+    switch (config.motionRole) {
+    case MotionRoleTransparent:
+      motionReturn += coverage + "    out.motion_transparency = vec4f(motion, 1.0, coverage);\n";
+      break;
+    case MotionRoleAlphaOwned:
+      motionReturn += coverage +
+                      "    out.motion_transparency = select(vec4f(motion, 1.0, coverage), vec4f(0.0, 0.0, 0.0, 1.0), "
+                      "prev.a >= 0.5);\n";
+      break;
+    default:
+      motionReturn += "    out.motion_transparency = vec4f(0.0, 0.0, 0.0, 1.0);\n";
+      break;
+    }
+    uniformPre += "\n"
+                  "struct FragmentOutput {\n"
+                  "    @location(0) color: vec4f,\n"
+                  "    @location(1) motion: vec4f,\n"
+                  "    @location(2) motion_depth: vec4f,\n"
+                  "    @location(3) motion_mark: vec4f,\n"
+                  "    @location(4) motion_transparency: vec4f,\n";
+    uniformPre += usesZTextureDepth ? "    @builtin(frag_depth) depth: f32,\n};" : "};";
+    fragmentReturnType = "FragmentOutput";
+    fragmentReturn = "    var out: FragmentOutput;\n"
+                     "    out.color = prev;\n" + motionReturn + "    return out;";
+  }
+  if (usesZTextureDepth && config.motionVectors) {
+    fragmentFn += fmt::format("\n    let fragDepth = {}ztexDepth;", UseReversedZ ? "1.0 - " : "");
+    fragmentReturn = "    var out: FragmentOutput;\n"
+                     "    out.color = prev;\n" + motionReturn + "    out.depth = fragDepth;\n    return out;";
+  } else if (usesZTextureDepth) {
     uniformPre +=
         "\n"
         "struct FragmentOutput {\n"
@@ -2175,6 +2290,16 @@ fn fs_main(in: VertexOutput) -> {9} {{{6}{5}
     apply_shader_debug(shaderSource, hash);
   }
   wgpu::ShaderSourceWGSL wgslDescriptor{};
+  if (config.motionVectors) {
+    // AURORA_MV_SHADER_DUMP=<dir>: write each generated motion-vector shader as <dir>/<hash>.wgsl.
+    static const char* shaderDumpDir = std::getenv("AURORA_MV_SHADER_DUMP");
+    if (shaderDumpDir != nullptr && shaderDumpDir[0] != '\0') {
+      if (FILE* f = std::fopen(fmt::format("{}/{:016x}.wgsl", shaderDumpDir, hash).c_str(), "wb")) {
+        std::fwrite(shaderSource.data(), 1, shaderSource.size(), f);
+        std::fclose(f);
+      }
+    }
+  }
   wgslDescriptor.code = shaderSource.c_str();
   const auto label = fmt::format("GX Shader {:x}", hash);
   const auto shaderDescriptor = wgpu::ShaderModuleDescriptor{

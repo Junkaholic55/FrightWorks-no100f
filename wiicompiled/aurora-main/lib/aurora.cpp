@@ -831,6 +831,699 @@ void complete_frame_capture(PendingFrameCapture& capture) {
   }
   capture.buffer.Unmap();
 }
+
+// ----- Motion-vector dump (AURORA_MV_DUMP_DIR): the EFB color and its motion vectors every
+// AURORA_MV_DUMP_INTERVAL frames (default 60) from frame AURORA_MV_DUMP_START (default 0), up to
+// AURORA_MV_DUMP_MAX dumps (default 30). With AURORA_MV_DUMP_TRIGGER=<file>, nothing is dumped until that file
+// appears; it is then deleted and the count restarts from that frame (touch it again for another series).
+// Writes efb_<frame>.png, mv_<frame>.png (grey = still, hue = direction, saturation = speed, full at 16 px)
+// and mv_<frame>.rg16f (raw: u32 width, u32 height, then RG half floats per pixel), and logs statistics.
+struct PendingMotionDump {
+  wgpu::Buffer motion;
+  wgpu::Buffer color;
+  wgpu::Buffer exported;  // the export texture as last presented (RG32F), when the export is on
+  uint32_t exportWidth = 0;
+  uint32_t exportHeight = 0;
+  uint32_t exportPitch = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t motionPitch = 0;
+  uint32_t colorPitch = 0;
+  uint64_t motionSize = 0;
+  uint64_t colorSize = 0;
+  bool bgra = false;
+  uint32_t frame = 0;
+  std::string dir;
+};
+
+float half_to_float(uint16_t h) noexcept {
+  const uint32_t sign = (h & 0x8000u) << 16;
+  const uint32_t exponent = (h >> 10) & 0x1Fu;
+  uint32_t mantissa = h & 0x3FFu;
+  uint32_t bits;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      bits = sign;
+    } else {
+      int e = -1;
+      do { ++e; mantissa <<= 1; } while ((mantissa & 0x400u) == 0);
+      bits = sign | static_cast<uint32_t>(127 - 15 - e) << 23 | (mantissa & 0x3FFu) << 13;
+    }
+  } else if (exponent == 31) {
+    bits = sign | 0x7F800000u | mantissa << 13;
+  } else {
+    bits = sign | (exponent + 127 - 15) << 23 | mantissa << 13;
+  }
+  float value;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+// ----- Display-space motion vectors and the motion-vector view.
+// The game presents a display copy of part of the EFB (480 of its 528 lines here), scaled; the display-space texture
+// holds, for each presented pixel, its motion in presented pixels (prev = pos + motion, y down): what a temporal
+// upscaler or frame generator that sees the presented picture needs. The view draws either as color instead of the
+// picture.
+std::atomic_int g_motionViewMode{-1};  // -1 = not read from AURORA_MV_VIEW yet
+std::atomic<float> g_motionViewScale{16.f};
+struct MotionPass {
+  wgpu::RenderPipeline pipeline;
+  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+  webgpu::TextureWithSampler target;
+  wgpu::Buffer params;
+};
+MotionPass g_displayMotionPass;
+MotionPass g_motionViewPass;
+
+int motion_view_mode() noexcept {
+  int mode = g_motionViewMode.load(std::memory_order_acquire);
+  if (mode < 0) {
+    const char* env = std::getenv("AURORA_MV_VIEW");
+    int expected = -1;
+    g_motionViewMode.compare_exchange_strong(expected, env != nullptr ? std::clamp(std::atoi(env), 0, 2) : 0,
+                                             std::memory_order_acq_rel);
+    mode = g_motionViewMode.load(std::memory_order_acquire);
+  }
+  return mode;
+}
+
+constexpr const char* kFullscreenTriangleWgsl = R"""(
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = array(vec2f(-1.0, 1.0), vec2f(-1.0, -3.0), vec2f(3.0, 1.0));
+    return vec4f(p[i], 0.0, 1.0);
+}
+)""";
+
+// Creates the pass's pipeline (for `format`), parameter buffer and `width` x `height` target when missing or stale.
+void prepare_motion_pass(MotionPass& pass, const char* label, const std::string& fragmentWgsl, wgpu::TextureFormat format,
+                         uint32_t width, uint32_t height, bool sampled) {
+  if (!pass.pipeline || pass.format != format) {
+    const std::string code = std::string(kFullscreenTriangleWgsl) + fragmentWgsl;
+    wgpu::ShaderSourceWGSL wgsl{};
+    wgsl.code = code.c_str();
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = label};
+    const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+    const wgpu::ColorTargetState target{.format = format};
+    const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main", .targetCount = 1, .targets = &target};
+    const wgpu::RenderPipelineDescriptor descriptor{
+        .label = label,
+        .vertex = {.module = module, .entryPoint = "vs_main"},
+        .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+        .fragment = &fragment,
+    };
+    pass.pipeline = g_device.CreateRenderPipeline(&descriptor);
+    pass.format = format;
+    pass.target = {};
+    const wgpu::BufferDescriptor params{
+        .label = label,
+        .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+        .size = sizeof(std::array<float, 12>),
+    };
+    pass.params = g_device.CreateBuffer(&params);
+  }
+  auto& target = pass.target;
+  if (width != 0 && (!target.texture || target.size.width != width || target.size.height != height)) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = label,
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
+        .size = {width, height, 1},
+        .format = format,
+    };
+    target.texture = g_device.CreateTexture(&descriptor);
+    target.view = target.texture.CreateView();
+    target.size = descriptor.size;
+    target.format = format;
+    if (sampled) {
+      const wgpu::SamplerDescriptor sampler{
+          .addressModeU = wgpu::AddressMode::ClampToEdge,
+          .addressModeV = wgpu::AddressMode::ClampToEdge,
+          .magFilter = wgpu::FilterMode::Linear,
+          .minFilter = wgpu::FilterMode::Linear,
+      };
+      target.sampler = g_device.CreateSampler(&sampler);
+    }
+  }
+}
+
+// Every pass's parameters: up to 12 floats (3 vec4f), padded with zeros.
+using MotionPassParams = std::array<float, 12>;
+
+// Bindings: input0, input1, the parameters, then `more` from binding 3 on.
+void run_motion_pass(const wgpu::CommandEncoder& encoder, MotionPass& pass, const MotionPassParams& params,
+                     wgpu::TextureView input0, wgpu::TextureView input1, const wgpu::TextureView* target = nullptr,
+                     std::initializer_list<wgpu::TextureView> more = {}) {
+  g_queue.WriteBuffer(pass.params, 0, params.data(), sizeof(params));
+  std::vector<wgpu::BindGroupEntry> entries{
+      wgpu::BindGroupEntry{.binding = 0, .textureView = std::move(input0)},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = std::move(input1)},
+      wgpu::BindGroupEntry{.binding = 2, .buffer = pass.params, .size = sizeof(params)},
+  };
+  for (const auto& view : more) {
+    entries.push_back(wgpu::BindGroupEntry{.binding = static_cast<uint32_t>(entries.size()), .textureView = view});
+  }
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .layout = pass.pipeline.GetBindGroupLayout(0),
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+  const wgpu::RenderPassColorAttachment attachment{
+      .view = target != nullptr ? *target : pass.target.view,
+      .loadOp = wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {0.0, 0.0, 0.0, 1.0},
+  };
+  const wgpu::RenderPassDescriptor passDescriptor{.colorAttachmentCount = 1, .colorAttachments = &attachment};
+  const auto renderPass = encoder.BeginRenderPass(&passDescriptor);
+  renderPass.SetPipeline(pass.pipeline);
+  renderPass.SetBindGroup(0, bindGroup);
+  renderPass.Draw(3);
+  renderPass.End();
+}
+
+// This frame's motion vectors in presented pixels, the size of `source` (nullptr without motion vectors).
+const webgpu::TextureWithSampler* encode_display_motion(const wgpu::CommandEncoder& encoder,
+                                                        const webgpu::PresentSource& source) {
+  const auto& motion = webgpu::g_motionVectors;
+  if (!gfx::motion_vectors_active() || !motion.texture || !source.texture || source.size.width == 0 ||
+      source.size.height == 0) {
+    return nullptr;
+  }
+  auto rect = source.efbRect;
+  if (rect[2] <= 0.f || rect[3] <= 0.f) {
+    rect = {0.f, 0.f, static_cast<float>(motion.size.width), static_cast<float>(motion.size.height)};
+  }
+  static std::array<float, 6> s_lastMapping{};
+  const std::array<float, 6> mapping{rect[0], rect[1], rect[2], rect[3], static_cast<float>(source.size.width),
+                                     static_cast<float>(source.size.height)};
+  if (mapping != s_lastMapping) {
+    s_lastMapping = mapping;
+    Log.info("Display motion vectors: EFB ({}, {}) {}x{} of {}x{} -> picture {}x{}", rect[0], rect[1], rect[2],
+             rect[3], motion.size.width, motion.size.height, source.size.width, source.size.height);
+  }
+  prepare_motion_pass(g_displayMotionPass, "Display motion vectors", R"""(
+struct Params {
+    rect: vec4f,      // EFB rectangle the picture was copied from (render pixels)
+    size: vec2f,      // presented picture size
+    pad: vec2f,
+};
+@group(0) @binding(0) var motion: texture_2d<f32>;
+@group(0) @binding(1) var unused: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    let toEfb = params.rect.zw / params.size;
+    let efb = params.rect.xy + pos.xy * toEfb;
+    let limit = vec2f(textureDimensions(motion)) - 1.0;
+    let mv = textureLoad(motion, vec2i(clamp(floor(efb), vec2f(0.0), limit)), 0).xy;
+    _ = textureDimensions(unused);
+    return vec4f(mv / toEfb, 0.0, 0.0);
+}
+)""", wgpu::TextureFormat::RG16Float, source.size.width, source.size.height, false);
+  run_motion_pass(encoder, g_displayMotionPass,
+                  {rect[0], rect[1], rect[2], rect[3], static_cast<float>(source.size.width),
+                   static_cast<float>(source.size.height), 0.f, 0.f},
+                  motion.view, motion.view);
+  return &g_displayMotionPass.target;
+}
+
+// The view (motion_view_mode() != 0): the present source to use instead of `source`.
+webgpu::PresentSource encode_motion_view(const wgpu::CommandEncoder& encoder, const webgpu::PresentSource& source,
+                                         const webgpu::TextureWithSampler* displayMotion) {
+  const int mode = motion_view_mode();
+  if (mode == 0 || displayMotion == nullptr) {
+    return source;
+  }
+  prepare_motion_pass(g_motionViewPass, "Motion vector view", R"""(
+struct Params {
+    mode: f32,
+    scale: f32,
+    pad: vec2f,
+    pad2: vec4f,
+};
+@group(0) @binding(0) var motion: texture_2d<f32>;
+@group(0) @binding(1) var picture: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn hue(h: f32) -> vec3f {
+    return clamp(abs(fract(vec3f(h) - vec3f(0.0, 1.0 / 3.0, 2.0 / 3.0)) * 2.0 - 1.0) * 3.0 - 1.0, vec3f(0.0), vec3f(1.0));
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    let xy = vec2i(pos.xy);
+    let mv = textureLoad(motion, xy, 0).xy;
+    let base = select(vec3f(0.5), textureLoad(picture, xy, 0).rgb * 0.5 + 0.25, params.mode > 1.5);
+    let speed = length(mv);
+    if (!(speed > 0.05)) {
+        return vec4f(base, 1.0);
+    }
+    let t = min(speed / params.scale, 1.0);
+    return vec4f(mix(base, hue(atan2(mv.y, mv.x) / 6.2831853), t), 1.0);
+}
+)""", source.format, source.size.width, source.size.height, true);
+  run_motion_pass(encoder, g_motionViewPass,
+                  {static_cast<float>(mode), std::max(g_motionViewScale.load(), 0.25f), 0.f, 0.f, 0.f, 0.f, 0.f, 0.f},
+                  displayMotion->view, source.texture.CreateView());
+  const auto& target = g_motionViewPass.target;
+  return {
+      .bindGroup = webgpu::create_copy_bind_group(target),
+      .texture = target.texture,
+      .size = target.size,
+      .format = target.format,
+      .efbRect = source.efbRect,  // same size as the picture it replaces
+  };
+}
+
+// ----- Motion-vector export (AURORA_MV_EXPORT=1 with motion vectors on), for a ReShade add-on feeding a temporal
+// upscaler or frame generator: every presentation image gets its own motion and depth (drawn with the picture's
+// viewport, so they match what is presented), and right before Present() the presented image's are drawn into one
+// fixed texture the size of the swapchain: RGBA32Float (the only one on the device, so the add-on can find it by its
+// description). x: the depth of the surface the vectors belong to, raw as the depth buffer holds it (reversed: 1 near,
+// 0 far; first, so the texture also works as a depth buffer for effects that read .x); y, z: delta UV of the presented
+// picture (previous position = uv + motion, y down); w: 0 outside the picture (motion 0, depth far), inside 1 + why the
+// pixel should use the current frame (0 = it should not; bits: 1 the HUD, 2 a surface hidden last frame, 4 transparent
+// layers moving differently from what is behind them).
+// Drawn, not copied, so it is in the render-target state after every frame.
+bool motion_export_active() noexcept {
+  static const bool requested = [] {
+    const char* env = std::getenv("AURORA_MV_EXPORT");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  return requested && gfx::motion_vectors_active();
+}
+MotionPass g_snapshotMotionPass;
+webgpu::TextureWithSampler g_previousMotionDepth;
+webgpu::TextureWithSampler g_previousMotionTransparency;
+
+void ensure_previous_copy(webgpu::TextureWithSampler& copy, const webgpu::TextureWithSampler& source,
+                          const char* label) {
+  if (copy.texture && copy.size.width == source.size.width && copy.size.height == source.size.height) {
+    return;
+  }
+  const wgpu::TextureDescriptor descriptor{
+      .label = label,
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+      .size = {source.size.width, source.size.height, 1},
+      .format = source.format,
+  };
+  copy.texture = g_device.CreateTexture(&descriptor);
+  copy.view = copy.texture.CreateView();
+  copy.size = descriptor.size;
+  copy.format = descriptor.format;
+}
+
+// After this frame's snapshots: its depth and transparency become next frame's "last frame".
+void encode_previous_motion_depth(const wgpu::CommandEncoder& encoder) {
+  const auto copy = [&](const webgpu::TextureWithSampler& from, const webgpu::TextureWithSampler& to) {
+    if (!from.texture || !to.texture || to.size.width != from.size.width || to.size.height != from.size.height) {
+      return;
+    }
+    const wgpu::TexelCopyTextureInfo source{.texture = from.texture};
+    const wgpu::TexelCopyTextureInfo destination{.texture = to.texture};
+    encoder.CopyTextureToTexture(&source, &destination, &from.size);
+  };
+  copy(webgpu::g_motionDepth, g_previousMotionDepth);
+  copy(webgpu::g_motionTransparency, g_previousMotionTransparency);
+}
+MotionPass g_presentedMotionPass;
+
+// Draws this frame's EFB motion and depth into the image's export texture: image pixel -> place in the picture
+// (viewport) -> EFB pixel (the rectangle the picture was copied from); motion scaled from EFB to image pixels.
+void encode_snapshot_motion(const wgpu::CommandEncoder& encoder, webgpu::TextureWithSampler& imageMotion,
+                            const wgpu::Extent3D& imageSize, const webgpu::Viewport& viewport,
+                            const std::array<float, 4>& efbRect) {
+  const auto& motion = webgpu::g_motionVectors;
+  // Not the depth buffer itself: the game clears it before its HUD, so by now it holds "far" everywhere.
+  const auto& depth = webgpu::g_motionDepth;
+  if (!imageMotion.texture || imageMotion.size.width != imageSize.width ||
+      imageMotion.size.height != imageSize.height) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Presentation image motion vectors and depth",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .size = {imageSize.width, imageSize.height, 1},
+        // The floats' bits as RGBA32Uint: the export texture must stay the only RGBA32Float one on the device.
+        .format = wgpu::TextureFormat::RGBA32Uint,
+    };
+    imageMotion.texture = g_device.CreateTexture(&descriptor);
+    imageMotion.view = imageMotion.texture.CreateView();
+    imageMotion.size = descriptor.size;
+    imageMotion.format = descriptor.format;
+  }
+  auto rect = efbRect;
+  if (rect[2] <= 0.f || rect[3] <= 0.f) {
+    rect = {0.f, 0.f, static_cast<float>(motion.size.width), static_cast<float>(motion.size.height)};
+  }
+  static std::array<float, 8> s_lastMapping{};
+  const std::array<float, 8> mapping{viewport.left, viewport.top, viewport.width, viewport.height,
+                                     rect[0], rect[1], rect[2], rect[3]};
+  if (mapping != s_lastMapping) {
+    s_lastMapping = mapping;
+    Log.info("Motion vector export: EFB ({}, {}) {}x{} drawn at ({}, {}) {}x{} in the {}x{} presented image", rect[0],
+             rect[1], rect[2], rect[3], viewport.left, viewport.top, viewport.width, viewport.height,
+             imageSize.width, imageSize.height);
+  }
+  // Last frame's depth and transparency (copied after its snapshots, see encode_previous_motion_depth).
+  ensure_previous_copy(g_previousMotionDepth, depth, "Motion vector depth, last frame");
+  ensure_previous_copy(g_previousMotionTransparency, webgpu::g_motionTransparency,
+                       "Motion vector transparency, last frame");
+  prepare_motion_pass(g_snapshotMotionPass, "Presentation image motion vectors and depth", R"""(
+struct Params {
+    viewport: vec4f,  // where the picture is drawn in the image (pixels)
+    rect: vec4f,      // EFB rectangle the picture was copied from (render pixels)
+    image: vec4f,     // image size (pixels), reversed Z (1 or 0), unused
+};
+@group(0) @binding(0) var motion: texture_2d<f32>;
+@group(0) @binding(1) var depth: texture_2d<f32>;          // x: depth now, y: this surface's depth last frame
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var mark: texture_2d<f32>;           // the 2D layer's "use the current frame"
+@group(0) @binding(4) var depthBefore: texture_2d<f32>;    // last frame's depth (x)
+@group(0) @binding(5) var transparency: texture_2d<f32>;   // transparent layers: motion * coverage (xy), coverage (z)
+@group(0) @binding(6) var transparencyBefore: texture_2d<f32>;  // the same, last frame
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4u {
+    let local = (pos.xy - params.viewport.xy) / params.viewport.zw;
+    if (any(local < vec2f(0.0)) || any(local >= vec2f(1.0))) {
+        return vec4u(0u);  // outside the picture: no motion, far depth (reversed Z), w 0
+    }
+    let size = vec2f(textureDimensions(motion));
+    let texel = vec2i(clamp(floor(params.rect.xy + local * params.rect.zw), vec2f(0.0), size - 1.0));
+    let efbMotion = textureLoad(motion, texel, 0).xy;
+    let d = textureLoad(depth, texel, 0).xy;
+    // Uncovered: where this surface was last frame, something nearer was visible (it was hidden), so there is no
+    // history for it. Nearer = larger depth with reversed Z; 1% plus a small bias keeps depth noise out.
+    var uncovered = 0.0;
+    var layerLeft = 0.0;
+    let layers = textureLoad(transparency, texel, 0);
+    let before = vec2f(texel) + 0.5 + efbMotion;
+    if (all(before >= vec2f(0.0)) && all(before < size)) {
+        // A transparent layer that was here last frame (where this surface was), moved differently from the surface,
+        // and has gone or faded: the history still shows it (a tree drawn as a cut-out sprite leaves its branches over
+        // the sky as the camera moves). One moving with the surface (a cut-out fringe on a rock) only changes coverage
+        // by sampling noise.
+        let layersBefore = textureLoad(transparencyBefore, vec2i(before), 0);
+        if (layersBefore.z > 0.35 && layers.z < layersBefore.z - 0.3 &&
+            length(layersBefore.xy / layersBefore.z - efbMotion) > 1.0) {
+            layerLeft = 1.0;
+        }
+        // All four texels around where it was must have been nearer: one texel alone flags bumpy surfaces
+        // (a rock's own relief) wherever the lookup rounds onto a neighbouring bump.
+        let corner = vec2i(floor(before - 0.5));
+        var nearer = true;
+        for (var i = 0; i < 4; i++) {
+            let at = clamp(corner + vec2i(i & 1, i >> 1), vec2i(0), vec2i(size) - 1);
+            let seen = textureLoad(depthBefore, at, 0).x;
+            let nearerForward = (seen < d.y * 0.99 - 1e-5);
+            let nearerReversed = (seen > d.y * 1.01 + 1e-5);
+            nearer = nearer && select(nearerForward, nearerReversed, params.image.z > 0.5);
+        }
+        uncovered = max(uncovered, select(0.0, 1.0, nearer));
+    }
+    // Transparent layers that move differently from the surface behind them (particles, a glow on something moving,
+    // a shadow following a character, leaf edges against the sky while the camera moves): more than a pixel apart.
+    var drifting = 0.0;
+    if (layers.z > 0.1) {
+        drifting = select(0.0, 1.0, length(layers.xy / layers.z - efbMotion) > 1.0);
+    }
+    // w = 1 + why the pixel should use the current frame (bits: 1 the 2D layer, 2 uncovered, 4 transparency moving
+    // differently); a consumer reads any w above 1 as "use the current frame".
+    let why = select(0.0, 1.0, textureLoad(mark, texel, 0).x > 0.5) + 2.0 * uncovered + 4.0 * max(drifting, layerLeft);
+    // EFB pixels -> image pixels -> delta UV of the image
+    let mv = efbMotion * (params.viewport.zw / params.rect.zw) / params.image.xy;
+    return bitcast<vec4u>(vec4f(d.x, mv, 1.0 + why));
+}
+)""", wgpu::TextureFormat::RGBA32Uint, 0, 0, false);
+  run_motion_pass(encoder, g_snapshotMotionPass,
+                  {viewport.left, viewport.top, viewport.width, viewport.height, rect[0], rect[1], rect[2], rect[3],
+                   static_cast<float>(imageSize.width), static_cast<float>(imageSize.height),
+                   gx::UseReversedZ ? 1.f : 0.f, 0.f},
+                  motion.view, depth.view, &imageMotion.view,
+                  {webgpu::g_motionMark.view, g_previousMotionDepth.view, webgpu::g_motionTransparency.view,
+                   g_previousMotionTransparency.view});
+}
+
+// Right before Present(): the presented image's motion and depth into the fixed export texture.
+void encode_presented_motion(const wgpu::CommandEncoder& encoder, const webgpu::TextureWithSampler& imageMotion) {
+  prepare_motion_pass(g_presentedMotionPass, "Presented motion vectors (export)", R"""(
+struct Params {
+    pad: vec4f,
+    pad2: vec4f,
+    pad3: vec4f,
+};
+@group(0) @binding(0) var motion: texture_2d<u32>;
+@group(0) @binding(1) var unused: texture_2d<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    _ = textureDimensions(unused);
+    _ = params.pad;
+    return bitcast<vec4f>(textureLoad(motion, vec2i(pos.xy), 0));
+}
+)""", wgpu::TextureFormat::RGBA32Float, imageMotion.size.width, imageMotion.size.height, false);
+  run_motion_pass(encoder, g_presentedMotionPass, {}, imageMotion.view, imageMotion.view);
+}
+
+std::optional<PendingMotionDump> encode_motion_dump(const wgpu::CommandEncoder& encoder) {
+  static const char* dir = std::getenv("AURORA_MV_DUMP_DIR");
+  if (dir == nullptr || dir[0] == '\0' || !gfx::motion_vectors_active() || !webgpu::g_motionVectors.texture ||
+      webgpu::g_graphicsConfig.msaaSamples > 1) {
+    return std::nullopt;
+  }
+  static const uint32_t interval = [] {
+    const char* v = std::getenv("AURORA_MV_DUMP_INTERVAL");
+    return v != nullptr ? std::max(1u, static_cast<uint32_t>(std::strtoul(v, nullptr, 10))) : 60u;
+  }();
+  static const uint32_t maxDumps = [] {
+    const char* v = std::getenv("AURORA_MV_DUMP_MAX");
+    return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 30u;
+  }();
+  static const uint32_t start = [] {
+    const char* v = std::getenv("AURORA_MV_DUMP_START");
+    return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+  }();
+  static const char* trigger = std::getenv("AURORA_MV_DUMP_TRIGGER");
+  static uint32_t dumps = 0;
+  static uint32_t seriesStart = trigger != nullptr && trigger[0] != '\0' ? UINT32_MAX : start;
+  const uint32_t frame = gfx::current_frame();
+  if (trigger != nullptr && trigger[0] != '\0' && frame % 10 == 0 && std::remove(trigger) == 0) {
+    seriesStart = frame + 1;
+    dumps = 0;
+    Log.info("Motion vector dump triggered at frame {}", frame);
+  }
+  if (frame < seriesStart || (frame - seriesStart) % interval != 0 || dumps >= maxDumps) {
+    return std::nullopt;
+  }
+  const auto& motion = webgpu::g_motionVectors;
+  const auto& color = webgpu::g_frameBuffer;
+  if (!color.texture || color.size.width != motion.size.width || color.size.height != motion.size.height ||
+      !capture_format_supported(color.format)) {
+    return std::nullopt;
+  }
+  ++dumps;
+  PendingMotionDump dump{
+      .width = motion.size.width,
+      .height = motion.size.height,
+      .motionPitch = align_to(motion.size.width * 4, 256),
+      .colorPitch = align_to(color.size.width * 4, 256),
+      .bgra = capture_format_bgra(color.format),
+      .frame = frame,
+      .dir = dir,
+  };
+  dump.motionSize = static_cast<uint64_t>(dump.motionPitch) * dump.height;
+  dump.colorSize = static_cast<uint64_t>(dump.colorPitch) * dump.height;
+  const auto makeBuffer = [](uint64_t size) {
+    const wgpu::BufferDescriptor descriptor{
+        .label = "Motion vector dump",
+        .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
+        .size = size,
+    };
+    return g_device.CreateBuffer(&descriptor);
+  };
+  dump.motion = makeBuffer(dump.motionSize);
+  dump.color = makeBuffer(dump.colorSize);
+  const wgpu::Extent3D size{dump.width, dump.height, 1};
+  const auto copy = [&](const wgpu::Texture& texture, const wgpu::Buffer& buffer, uint32_t pitch) {
+    const wgpu::TexelCopyTextureInfo source{.texture = texture, .mipLevel = 0, .origin = {0, 0, 0},
+                                            .aspect = wgpu::TextureAspect::All};
+    const wgpu::TexelCopyBufferInfo destination{
+        .layout = {.offset = 0, .bytesPerRow = pitch, .rowsPerImage = dump.height}, .buffer = buffer};
+    encoder.CopyTextureToBuffer(&source, &destination, &size);
+  };
+  copy(motion.texture, dump.motion, dump.motionPitch);
+  copy(color.texture, dump.color, dump.colorPitch);
+  if (const auto& exported = g_presentedMotionPass.target; exported.texture) {
+    dump.exportWidth = exported.size.width;
+    dump.exportHeight = exported.size.height;
+    dump.exportPitch = align_to(exported.size.width * 16, 256);
+    dump.exported = makeBuffer(static_cast<uint64_t>(dump.exportPitch) * dump.exportHeight);
+    const wgpu::Extent3D exportSize{dump.exportWidth, dump.exportHeight, 1};
+    const wgpu::TexelCopyTextureInfo source{.texture = exported.texture};
+    const wgpu::TexelCopyBufferInfo destination{
+        .layout = {.offset = 0, .bytesPerRow = dump.exportPitch, .rowsPerImage = dump.exportHeight},
+        .buffer = dump.exported};
+    encoder.CopyTextureToBuffer(&source, &destination, &exportSize);
+  }
+  return dump;
+}
+
+void complete_motion_dump(PendingMotionDump& dump) {
+  const auto map = [](wgpu::Buffer& buffer, uint64_t size) {
+    wgpu::MapAsyncStatus status = wgpu::MapAsyncStatus::CallbackCancelled;
+    const auto future = buffer.MapAsync(wgpu::MapMode::Read, 0, size, wgpu::CallbackMode::WaitAnyOnly,
+                                        [&status](wgpu::MapAsyncStatus s, wgpu::StringView) { status = s; });
+    const auto wait = g_instance.WaitAny(future, 5000000000);
+    return wait == wgpu::WaitStatus::Success && status == wgpu::MapAsyncStatus::Success;
+  };
+  if (!map(dump.motion, dump.motionSize) || !map(dump.color, dump.colorSize)) {
+    Log.error("Motion vector dump {} readback failed", dump.frame);
+    return;
+  }
+  const auto* mv = static_cast<const uint8_t*>(dump.motion.GetConstMappedRange(0, dump.motionSize));
+  const auto* px = static_cast<const uint8_t*>(dump.color.GetConstMappedRange(0, dump.colorSize));
+  const size_t pixels = static_cast<size_t>(dump.width) * dump.height;
+  std::vector<uint8_t> colorRgb(pixels * 3), motionRgb(pixels * 3);
+  std::vector<uint16_t> raw(pixels * 2);
+  const int r = dump.bgra ? 2 : 0, b = dump.bgra ? 0 : 2;
+  double sum = 0.0;
+  float maxSpeed = 0.f;
+  size_t moving = 0, invalid = 0;
+  for (uint32_t y = 0; y < dump.height; ++y) {
+    const uint8_t* srcColor = px + static_cast<size_t>(y) * dump.colorPitch;
+    const auto* srcMotion = reinterpret_cast<const uint16_t*>(mv + static_cast<size_t>(y) * dump.motionPitch);
+    for (uint32_t x = 0; x < dump.width; ++x) {
+      const size_t i = static_cast<size_t>(y) * dump.width + x;
+      colorRgb[i * 3 + 0] = srcColor[x * 4 + r];
+      colorRgb[i * 3 + 1] = srcColor[x * 4 + 1];
+      colorRgb[i * 3 + 2] = srcColor[x * 4 + b];
+      raw[i * 2 + 0] = srcMotion[x * 2 + 0];
+      raw[i * 2 + 1] = srcMotion[x * 2 + 1];
+      const float mx = half_to_float(srcMotion[x * 2 + 0]);
+      const float my = half_to_float(srcMotion[x * 2 + 1]);
+      float rgb[3] = {0.5f, 0.5f, 0.5f};
+      if (!std::isfinite(mx) || !std::isfinite(my)) {
+        ++invalid;
+        rgb[0] = 1.f; rgb[1] = 0.f; rgb[2] = 1.f;
+      } else {
+        const float speed = std::sqrt(mx * mx + my * my);
+        if (speed > 0.05f) {
+          ++moving;
+          sum += speed;
+          maxSpeed = std::max(maxSpeed, speed);
+          const float angle = std::atan2(my, mx) / 6.2831853f;
+          const float t = std::min(speed / 16.f, 1.f);
+          for (int c = 0; c < 3; ++c) {
+            float f = angle - static_cast<float>(c) / 3.f;
+            f -= std::floor(f);
+            const float hue = std::clamp(3.f * std::fabs(2.f * f - 1.f) - 1.f, 0.f, 1.f);
+            rgb[c] = 0.5f + (hue - 0.5f) * t;
+          }
+        }
+      }
+      for (int c = 0; c < 3; ++c) {
+        motionRgb[i * 3 + c] = static_cast<uint8_t>(std::clamp(rgb[c], 0.f, 1.f) * 255.f + 0.5f);
+      }
+    }
+  }
+  dump.motion.Unmap();
+  dump.color.Unmap();
+  aurora_write_png_rgb(fmt::format("{}/efb_{:06}.png", dump.dir, dump.frame).c_str(), colorRgb.data(), dump.width,
+                       dump.height);
+  aurora_write_png_rgb(fmt::format("{}/mv_{:06}.png", dump.dir, dump.frame).c_str(), motionRgb.data(), dump.width,
+                       dump.height);
+  if (FILE* f = std::fopen(fmt::format("{}/mv_{:06}.rg16f", dump.dir, dump.frame).c_str(), "wb")) {
+    std::fwrite(&dump.width, sizeof(uint32_t), 1, f);
+    std::fwrite(&dump.height, sizeof(uint32_t), 1, f);
+    std::fwrite(raw.data(), sizeof(uint16_t), raw.size(), f);
+    std::fclose(f);
+  }
+  if (dump.exported && map(dump.exported, static_cast<uint64_t>(dump.exportPitch) * dump.exportHeight)) {
+    const auto* ex = static_cast<const uint8_t*>(
+        dump.exported.GetConstMappedRange(0, static_cast<uint64_t>(dump.exportPitch) * dump.exportHeight));
+    double exSum = 0.0, depthSum = 0.0;
+    size_t exMoving = 0, inside = 0;
+    float centre[2] = {0.f, 0.f};
+    float depthMin = 1e30f, depthMax = -1e30f, centreDepth = 0.f;
+    std::vector<uint8_t> depthImage(static_cast<size_t>(dump.exportWidth) * dump.exportHeight * 3);
+    std::vector<uint8_t> maskImage(depthImage.size());  // colored where the mask says "use the current frame"
+    size_t masked = 0;
+    std::array<size_t, 8> whyCount{};
+    for (uint32_t y = 0; y < dump.exportHeight; ++y) {
+      const auto* row = reinterpret_cast<const float*>(ex + static_cast<size_t>(y) * dump.exportPitch);
+      for (uint32_t x = 0; x < dump.exportWidth; ++x) {
+        const float d = row[x * 4];
+        // Depth picture: reversed Z (near 1), shown with a square root so distant ground keeps some contrast.
+        const uint8_t shade = static_cast<uint8_t>(std::clamp(std::sqrt(std::max(d, 0.f)), 0.f, 1.f) * 255.f);
+        const size_t o = (static_cast<size_t>(y) * dump.exportWidth + x) * 3;
+        depthImage[o] = depthImage[o + 1] = depthImage[o + 2] = shade;
+        if (row[x * 4 + 3] > 1.5f) {
+          // red: the 2D layer, green: uncovered, blue: transparency moving differently
+          const int why = static_cast<int>(row[x * 4 + 3] - 1.f + 0.5f);
+          const size_t o = (static_cast<size_t>(y) * dump.exportWidth + x) * 3;
+          maskImage[o] = (why & 1) ? 255 : 0;
+          maskImage[o + 1] = (why & 2) ? 255 : 0;
+          maskImage[o + 2] = (why & 4) ? 255 : 0;
+          ++masked;
+          ++whyCount[why & 7];
+        }
+        if (row[x * 4 + 3] > 0.5f) {
+          ++inside;
+          depthSum += d;
+          depthMin = std::min(depthMin, d);
+          depthMax = std::max(depthMax, d);
+        }
+        if (x == dump.exportWidth / 2 && y == dump.exportHeight / 2) {
+          centreDepth = d;
+        }
+        const float px = row[x * 4 + 1] * dump.exportWidth, py = row[x * 4 + 2] * dump.exportHeight;
+        const float speed = std::sqrt(px * px + py * py);
+        if (speed > 0.05f) {
+          ++exMoving;
+          exSum += speed;
+        }
+        if (x == dump.exportWidth / 2 && y == dump.exportHeight / 2) {
+          centre[0] = px;
+          centre[1] = py;
+        }
+      }
+    }
+    dump.exported.Unmap();
+    aurora_write_png_rgb(fmt::format("{}/depth_{:06}.png", dump.dir, dump.frame).c_str(), depthImage.data(),
+                         dump.exportWidth, dump.exportHeight);
+    for (size_t i = 0; i < maskImage.size(); i += 3) {
+      if (maskImage[i] == 0 && maskImage[i + 1] == 0 && maskImage[i + 2] == 0) {  // unmasked: the depth picture, dimmed
+        maskImage[i] = maskImage[i + 1] = maskImage[i + 2] = depthImage[i] / 2;
+      }
+    }
+    aurora_write_png_rgb(fmt::format("{}/mask_{:06}.png", dump.dir, dump.frame).c_str(), maskImage.data(),
+                         dump.exportWidth, dump.exportHeight);
+    Log.info("Motion vector dump frame {}: export {}x{} (last presented), moving {:.1f}%, mean {:.2f} px, centre "
+             "({:.2f}, {:.2f}) px; depth min {:.5f} max {:.5f} mean {:.5f} centre {:.5f}, picture {:.1f}% of the image, "
+             "use-current-frame mask {:.2f}% of the picture (2D {:.2f}%, uncovered {:.2f}%, transparency {:.2f}%)",
+             dump.frame, dump.exportWidth, dump.exportHeight,
+             100.0 * exMoving / std::max<size_t>(size_t{dump.exportWidth} * dump.exportHeight, 1),
+             exMoving ? exSum / exMoving : 0.0, centre[0], centre[1], inside ? depthMin : 0.f,
+             inside ? depthMax : 0.f, inside ? depthSum / inside : 0.0, centreDepth,
+             100.0 * inside / std::max<size_t>(size_t{dump.exportWidth} * dump.exportHeight, 1),
+             100.0 * masked / std::max<size_t>(inside, 1),
+             100.0 * (whyCount[1] + whyCount[3] + whyCount[5] + whyCount[7]) / std::max<size_t>(inside, 1),
+             100.0 * (whyCount[2] + whyCount[3] + whyCount[6] + whyCount[7]) / std::max<size_t>(inside, 1),
+             100.0 * (whyCount[4] + whyCount[5] + whyCount[6] + whyCount[7]) / std::max<size_t>(inside, 1));
+  }
+  {
+    const auto* centreMv = reinterpret_cast<const uint16_t*>(
+        raw.data() + (static_cast<size_t>(dump.height / 2) * dump.width + dump.width / 2) * 2);
+    Log.info("Motion vector dump frame {}: EFB centre ({:.2f}, {:.2f}) px", dump.frame, half_to_float(centreMv[0]),
+             half_to_float(centreMv[1]));
+  }
+  Log.info("Motion vector dump frame {}: {}x{}, moving {:.1f}%, mean {:.2f} px, max {:.1f} px, invalid {}",
+           dump.frame, dump.width, dump.height, 100.0 * moving / std::max<size_t>(pixels, 1),
+           moving ? sum / moving : 0.0, maxSpeed, invalid);
+}
+
 #endif
 
 // AuroraBackend is an anonymous C typedef enum, which magic_enum cannot
@@ -1102,6 +1795,9 @@ std::optional<AcquiredSurfaceTexture> acquire_surface_texture() noexcept {
 struct PresentationImage {
   webgpu::TextureWithSampler texture;
   wgpu::BindGroup bindGroup;
+  // Motion-vector export: this image's motion (see motion_export_active); written by the snapshot that draws it.
+  mutable webgpu::TextureWithSampler motion;
+  mutable bool hasMotion = false;
 };
 
 struct PresentationJob {
@@ -1232,6 +1928,9 @@ bool present_presentation_job(const PresentationJob& job) {
                          0.f, 1.f);
         pass.Draw(3);
         pass.End();
+        if (job.image->hasMotion && job.image->motion.texture) {
+          encode_presented_motion(encoder, job.image->motion);
+        }
         const auto encodeFinished = PresentClock::now();
         encodeDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
             encodeFinished - workStarted - acquireDuration);
@@ -1597,7 +2296,8 @@ wgpu::BindGroup encode_presentation_snapshot(wgpu::CommandEncoder& encoder,
                                               const webgpu::PresentSource& presentSource,
                                               const PresentationImage& image,
                                               bool includeImGui, bool metalfxEnabled,
-                                              const wgpu::BindGroup* cachedMetalFXOutput = nullptr) {
+                                              const wgpu::BindGroup* cachedMetalFXOutput = nullptr,
+                                              bool exportMotion = false) {
   ZoneScoped;
   auto viewport = webgpu::calculate_present_viewport(
       image.texture.size.width, image.texture.size.height, presentSource.size.width,
@@ -1636,6 +2336,10 @@ wgpu::BindGroup encode_presentation_snapshot(wgpu::CommandEncoder& encoder,
     pass.Draw(3);
     pass.End();
   }
+  image.hasMotion = exportMotion;
+  if (exportMotion) {
+    encode_snapshot_motion(encoder, image.motion, image.texture.size, viewport, presentSource.efbRect);
+  }
   if (includeImGui) {
     const std::array attachments{
         wgpu::RenderPassColorAttachment{
@@ -1652,7 +2356,7 @@ wgpu::BindGroup encode_presentation_snapshot(wgpu::CommandEncoder& encoder,
     const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
     pass.SetViewport(0.f, 0.f, static_cast<float>(image.texture.size.width),
                      static_cast<float>(image.texture.size.height), 0.f, 1.f);
-    imgui::render(pass);
+    imgui::render(pass, image.texture.size.width, image.texture.size.height);
     pass.End();
   }
   return newMetalFXOutput;
@@ -1895,6 +2599,14 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
   // A demanded CPU-visible EFB readback submits a prefix of the frame, so replaying the resumed
   // stream would mutate an already-rendered EFB. Render once, then duplicate into the slots.
   gfx::render(sealedFrame, encoder, -1, true);
+  auto pendingMotionDump = encode_motion_dump(encoder);
+  const bool exportMotion = motion_export_active() && webgpu::g_motionVectors.texture &&
+                            webgpu::g_motionDepth.texture && webgpu::g_motionMark.texture &&
+                            webgpu::g_motionTransparency.texture;
+  if (motion_view_mode() != 0) {
+    ctx.presentSource =
+        encode_motion_view(encoder, ctx.presentSource, encode_display_motion(encoder, ctx.presentSource));
+  }
   // The copy targets now hold this frame's resolves, so queue their readbacks on the same encoder;
   // completion is harvested in gfx::after_submit, never waited on here.
   gfx::efb_ram::encode_async_downloads(encoder);
@@ -1906,7 +2618,7 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
           acquire_presentation_image(interpolatedFrame, ctx.snapshotWidth, ctx.snapshotHeight);
       const auto newMetalFXOutput = encode_presentation_snapshot(
           encoder, ctx.presentSource, *image, true, ctx.metalfxEnabled,
-          duplicatedMetalFXOutput ? &duplicatedMetalFXOutput : nullptr);
+          duplicatedMetalFXOutput ? &duplicatedMetalFXOutput : nullptr, exportMotion);
       if (!duplicatedMetalFXOutput && newMetalFXOutput) {
         duplicatedMetalFXOutput = newMetalFXOutput;
       }
@@ -1924,7 +2636,10 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
   auto finalImage =
       acquire_presentation_image(ctx.interpolatedFrameCount, ctx.snapshotWidth, ctx.snapshotHeight);
   encode_presentation_snapshot(encoder, ctx.presentSource, *finalImage, true, ctx.metalfxEnabled,
-                               duplicatedMetalFXOutput ? &duplicatedMetalFXOutput : nullptr);
+                               duplicatedMetalFXOutput ? &duplicatedMetalFXOutput : nullptr, exportMotion);
+  if (exportMotion) {
+    encode_previous_motion_depth(encoder);
+  }
   auto pendingFrameCapture =
       encode_frame_capture(encoder, ctx.presentSource, ctx.snapshotWidth, ctx.snapshotHeight);
   encode_video_frame(encoder, ctx.presentSource, ctx.snapshotWidth, ctx.snapshotHeight);
@@ -1974,6 +2689,9 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
   start_video_readbacks();
   if (pendingFrameCapture.has_value()) {
     complete_frame_capture(*pendingFrameCapture);
+  }
+  if (pendingMotionDump.has_value()) {
+    complete_motion_dump(*pendingMotionDump);
   }
   gfx::after_submit();
   gfx::g_stats.presentedFrameCount = static_cast<uint32_t>(presentationJobs.size());
@@ -2482,6 +3200,33 @@ uint32_t aurora_get_monitors(AuroraMonitor* monitors, uint32_t maxCount) {
   return aurora::window::get_monitors(monitors, maxCount);
 }
 void aurora_set_fullscreen_monitor(const char* id) { aurora::window::set_fullscreen_monitor(id); }
+bool aurora_motion_vectors_active() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::motion_vectors_active();
+#else
+  return false;
+#endif
+}
+void aurora_set_motion_vector_view(int mode, float scale) {
+#ifdef AURORA_ENABLE_GX
+  aurora::g_motionViewMode.store(std::clamp(mode, 0, 2), std::memory_order_release);
+  if (scale > 0.f) aurora::g_motionViewScale.store(scale);
+#endif
+}
+int aurora_get_motion_vector_view() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::motion_view_mode();
+#else
+  return 0;
+#endif
+}
+float aurora_get_motion_vector_view_scale() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::g_motionViewScale.load();
+#else
+  return 16.f;
+#endif
+}
 void aurora_set_cutout_mode(int mode) {
 #ifdef AURORA_ENABLE_GX
   if (mode >= 0 && mode <= static_cast<int>(aurora::gx::CutoutMode::TwoPassAll))

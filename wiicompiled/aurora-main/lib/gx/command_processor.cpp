@@ -2094,7 +2094,8 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
 static inline bool frame_interpolation_identity_needed() noexcept {
   // SPM draws its levels with an orthographic camera, so orthographic draws interpolate too (the
   // perspective-only gate was for NSMBW, whose orthographic draws are only HUD).
-  return frame_interpolation_active();
+  // Motion vectors pair draws across frames with the same machinery.
+  return frame_interpolation_active() || gfx::motion_vectors_active();
 }
 
 static uint32_t matrix_index_prefix_size(GXVtxFmt fmt) noexcept {
@@ -2833,6 +2834,11 @@ static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t verte
   for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
     if (g_gxState.vtxDesc[i] == GX_INDEX8 || g_gxState.vtxDesc[i] == GX_INDEX16)  // uploaded every draw
       demand[3] += gfx::staging_storage_bytes(g_gxState.arrays[i].size);
+  }
+  if (g_gxState.vtxDesc[GX_VA_POS] == GX_INDEX8 || g_gxState.vtxDesc[GX_VA_POS] == GX_INDEX16) {
+    // Motion vectors: last frame's copy of a CPU-animated model's positions, uploaded with the uniforms.
+    if (const uint32_t history = motion_vertex_history_bytes(g_gxState.arrays[GX_VA_POS].size); history != 0)
+      demand[3] += gfx::staging_storage_bytes(history);
   }
   return gfx::staging_has_space(demand);
 }

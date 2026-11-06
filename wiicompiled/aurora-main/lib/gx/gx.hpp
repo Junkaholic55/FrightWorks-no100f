@@ -472,7 +472,8 @@ void initialize() noexcept;
 void shutdown() noexcept;
 void clear_copy_texture_cache() noexcept;
 void clear_display_copy_cache() noexcept;
-void set_display_copy_present_source() noexcept;
+// `efbRect`: the render-target rectangle the display copy was made from (see webgpu::PresentSource::efbRect).
+void set_display_copy_present_source(std::array<float, 4> efbRect = {}) noexcept;
 void evict_copy_texture(const void* dest) noexcept;
 // NSMBW: the cached static textures whose RAM holds `dest` (a copy patching part of a texture).
 struct PatchTarget {
@@ -570,7 +571,8 @@ struct ShaderConfig {
   u8 dualTexEnabled : 1 = 0;
   u8 fogRangeAdjust : 1 = 0;
   u8 zFreeze : 1 = 0; // GX coplanar mode (genMode bit 19): depth comes from the reference plane
-  u8 pad1 : 3 = 0;
+  u8 motionVectors : 1 = 0; // the pass has a motion-vector target (location 1); see gfx::motion_vectors_active
+  u8 motionRole : 2 = 0;    // how the draw writes the "use the current frame" mark (MotionRole), with motionVectors
   u8 numTexGens = 0;
   u32 zTexture = 0; // bias[0:23], format[24:25], op[26:27]; 0 disables shader depth output.
   std::array<AttrConfig, MaxVtxAttr> attrs;
@@ -752,6 +754,16 @@ struct UniformMatrixLayout {
   bool absolutePosRegion = false;
 };
 // Output info from shader generation
+// Motion vectors: what a draw contributes besides its own motion vectors. A temporal upscaler should use the current
+// frame where the vectors cannot describe what is seen: the 2D layer (marked outright) and transparent layers that
+// move differently from the surface behind them (their own motion, weighted by coverage, goes to the transparency
+// target; the export compares it with the owner's motion).
+enum MotionRole : u8 {
+  MotionRoleOwner = 0,       // owns its pixels (if it writes motion): clears the transparency over them
+  MotionRoleTransparent = 1, // blended effect (particles, glows, fog, shadows, cut-out fringes): adds its motion
+  MotionRoleAlphaOwned = 2,  // alpha-blended surface writing depth: owns where >= 50% opaque, transparent elsewhere
+  MotionRoleLayer2D = 3,     // HUD, menus (orthographic): marks its pixels "use the current frame"
+};
 struct ShaderInfo {
   std::bitset<MaxTexCoord> sampledTexCoords;
   std::bitset<MaxTextures> sampledTextures;
@@ -772,6 +784,10 @@ struct ShaderInfo {
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
   bool zFreeze : 1 = false;
+  // Motion vectors: last frame's viewport, projection and position matrices follow everything else
+  // in the uniform block (filled at frame seal by frame interpolation's draw pairing).
+  bool motionPrev : 1 = false;
+  u32 motionPrevOffset = 0;
   u8 lineMode : 2 = 0;
 };
 struct BindGroupRanges {

@@ -30,6 +30,9 @@ struct PresentSource {
   wgpu::Texture texture;
   wgpu::Extent3D size;
   wgpu::TextureFormat format;
+  // The render-target (EFB) rectangle the picture was copied from, x, y, width, height in render pixels; zero width
+  // = the render target itself, 1:1. Motion vectors map through it to the presented picture.
+  std::array<float, 4> efbRect{};
 };
 struct Viewport {
   float left;
@@ -54,6 +57,22 @@ extern GraphicsConfig g_graphicsConfig;
 extern TextureWithSampler g_frameBuffer;
 extern TextureWithSampler g_frameBufferResolved;
 extern TextureWithSampler g_depthBuffer;
+// RG16F, render-target size: per-pixel motion vectors when gfx::motion_vectors_active() (else empty).
+extern TextureWithSampler g_motionVectors;
+// RG32F, same size: the depth of the surface that owns each pixel's motion (raw, as the depth buffer holds it), now
+// and last frame, so it survives the game clearing the depth buffer before its HUD.
+extern TextureWithSampler g_motionDepth;
+// R8, same size: 1 where the 2D layer (HUD, menus) is drawn: a temporal upscaler should use the current frame there.
+extern TextureWithSampler g_motionMark;
+TextureWithSampler create_motion_mark_texture(uint32_t width, uint32_t height);
+// RGBA16F, same size: transparent layers' motion weighted by their coverage (x, y) and the coverage (z), cleared where a
+// surface owning the pixel is drawn over them.
+extern TextureWithSampler g_motionTransparency;
+TextureWithSampler create_motion_transparency_texture(uint32_t width, uint32_t height);
+TextureWithSampler create_motion_vector_texture(uint32_t width, uint32_t height);
+TextureWithSampler create_motion_depth_texture(uint32_t width, uint32_t height);
+// The device can blend 32-bit float targets (motion depth of alpha-blended surfaces needs it).
+extern bool g_float32Blendable;
 extern wgpu::RenderPipeline g_CopyPipeline;
 extern wgpu::RenderPipeline g_PresentPipeline;
 extern wgpu::BindGroup g_CopyBindGroup;
@@ -93,7 +112,7 @@ TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool m
 const TextureWithSampler& present_source() noexcept;
 PresentSource current_present_source() noexcept;
 void set_present_source_override(wgpu::BindGroup bindGroup, wgpu::Texture texture, wgpu::Extent3D size,
-                                 wgpu::TextureFormat format) noexcept;
+                                 wgpu::TextureFormat format, std::array<float, 4> efbRect = {}) noexcept;
 void clear_present_source_override() noexcept;
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source);
 wgpu::BindGroup create_copy_bind_group(wgpu::TextureView sourceView, wgpu::Sampler sampler);

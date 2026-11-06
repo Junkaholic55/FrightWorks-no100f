@@ -21,7 +21,7 @@ struct PipelineConfig {
   bool clearColor = true;
   bool clearAlpha = true;
   bool clearDepth = true;
-  uint8_t _pad = 0;
+  uint8_t motionVectors = 0; // the pass has a motion-vector target; cleared to zero with the color
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
 

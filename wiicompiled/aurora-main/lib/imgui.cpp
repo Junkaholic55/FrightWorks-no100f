@@ -201,7 +201,7 @@ void render_frame_data() noexcept {
   g_frameDataBuilt = true;
 }
 
-void render(const wgpu::RenderPassEncoder& pass) noexcept {
+void render(const wgpu::RenderPassEncoder& pass, uint32_t targetWidth, uint32_t targetHeight) noexcept {
   ZoneScoped;
   render_frame_data();
 
@@ -211,9 +211,22 @@ void render(const wgpu::RenderPassEncoder& pass) noexcept {
     SDL_RenderClear(renderer);
     ImGui_ImplSDLRenderer3_RenderDrawData(data, renderer);
     SDL_RenderPresent(renderer);
-  } else {
+  } else if (data != nullptr) {
     pass.PushDebugGroup("Aurora: Dear Imgui");
-    ImGui_ImplWGPU_RenderDrawData(data, pass.Get());
+    const float drawnWidth = data->DisplaySize.x * data->FramebufferScale.x;
+    const float drawnHeight = data->DisplaySize.y * data->FramebufferScale.y;
+    if (targetWidth != 0 && targetHeight != 0 && data->DisplaySize.x > 0.f && data->DisplaySize.y > 0.f &&
+        (std::lround(drawnWidth) != static_cast<long>(targetWidth) ||
+         std::lround(drawnHeight) != static_cast<long>(targetHeight))) {
+      // The window was resized after this ImGui frame began: draw it scaled to the target for this one frame
+      // (a shallow copy, as render_capture does) instead of with scissors outside the render area.
+      ImDrawData scaled = *data;
+      scaled.FramebufferScale = ImVec2(static_cast<float>(targetWidth) / data->DisplaySize.x,
+                                       static_cast<float>(targetHeight) / data->DisplaySize.y);
+      ImGui_ImplWGPU_RenderDrawData(&scaled, pass.Get());
+    } else {
+      ImGui_ImplWGPU_RenderDrawData(data, pass.Get());
+    }
     pass.PopDebugGroup();
   }
 }

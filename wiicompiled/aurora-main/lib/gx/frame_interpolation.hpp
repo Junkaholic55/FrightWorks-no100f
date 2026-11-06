@@ -34,7 +34,20 @@ struct InterpolatedUniformLayout {
   // Slot the live matrix occupies; a compacted position region holds it at 0.
   size_t currentMatrix = 0;
   bool indexedMatrices = false;
+  // Motion vectors: the draw's previous-transform block (viewport, projection, position region; see
+  // ShaderInfo::motionPrev), filled with last frame's matrices at seal when the draw pairs. Null if none.
+  uint8_t* motionPrevData = nullptr;
+  // Motion vectors, vertex history: the draw's indexed POS array as it is in RAM now (null if POS is not indexed).
+  // CPU-animated models rewrite it every frame; last frame's copy gives each vertex its previous position.
+  const uint8_t* posArrayData = nullptr;
+  uint32_t posArraySize = 0;
 };
+// Extra staging storage a draw may need for its previous POS array (see InterpolatedUniformLayout::posArrayData).
+uint32_t motion_vertex_history_bytes(uint32_t posArraySize) noexcept;
+// Motion vectors, HUD: every draw with a motion block, in order. The game clears depth with a screen quad right before
+// its HUD, so at seal the draws after the last such clear that follows some 3D drawing are flagged as the HUD
+// (mv_prev_pos.y bit 1) and mark their pixels "use the current frame". (The frame's first clear comes before any 3D.)
+void note_motion_draw(uint8_t* motionPrevData, bool perspective, bool depthClear) noexcept;
 
 namespace detail {
 // Defined in frame_interpolation.cpp, exposed so the early-outs below stay inline: the shipped

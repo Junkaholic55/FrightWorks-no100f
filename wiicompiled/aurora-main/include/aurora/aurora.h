@@ -225,6 +225,14 @@ void aurora_set_fullscreen_monitor(const char* id);
 #define AURORA_HAS_CUTOUT_MODE 1
 void aurora_set_cutout_mode(int mode);
 int aurora_get_cutout_mode();
+// Motion vectors (env AURORA_MOTION_VECTORS=1 at start, single-sampled EFB only): where every surface was last
+// frame, per pixel. The view shows them on screen: 0 = off, 1 = motion only, 2 = over a dimmed picture (grey or the
+// picture = still, hue = direction, saturation = speed, full at `scale` pixels per frame; 0 keeps the scale).
+#define AURORA_HAS_MOTION_VECTORS 1
+bool aurora_motion_vectors_active();
+void aurora_set_motion_vector_view(int mode, float scale);
+int aurora_get_motion_vector_view();
+float aurora_get_motion_vector_view_scale();
 
 typedef enum {
   AURORA_METALFX_DISABLED,

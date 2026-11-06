@@ -345,6 +345,10 @@ void begin_offscreen(uint32_t width, uint32_t height);
 void end_offscreen();
 bool is_offscreen() noexcept;
 uint32_t get_sample_count() noexcept;
+// Motion vectors (AURORA_MOTION_VECTORS=1, single-sampled EFB only): every render pass gets an RG16F
+// target at location 1 holding, per pixel, where that surface was last frame minus where it is now, in
+// render-target pixels. Written by GX draws that write depth or are opaque; zero where nothing moved.
+bool motion_vectors_active() noexcept;
 void clear_caches() noexcept;
 
 namespace tex_palette_conv {

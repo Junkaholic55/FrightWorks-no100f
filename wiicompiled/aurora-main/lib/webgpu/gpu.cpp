@@ -1,5 +1,7 @@
 #include "gpu.hpp"
 
+namespace aurora::gfx { bool motion_vectors_active() noexcept; }
+
 #include <array>
 #include <algorithm>
 #include <atomic>
@@ -52,6 +54,11 @@ wgpu::Surface g_surface;
 wgpu::BackendType g_backendType;
 GraphicsConfig g_graphicsConfig;
 TextureWithSampler g_frameBuffer;
+TextureWithSampler g_motionVectors;
+TextureWithSampler g_motionDepth;
+TextureWithSampler g_motionMark;
+TextureWithSampler g_motionTransparency;
+bool g_float32Blendable = false;
 TextureWithSampler g_frameBufferResolved;
 TextureWithSampler g_depthBuffer;
 
@@ -65,6 +72,7 @@ static wgpu::BindGroup g_presentSourceOverrideBindGroup;
 static wgpu::Texture g_presentSourceOverrideTexture;
 static wgpu::Extent3D g_presentSourceOverrideSize{};
 static wgpu::TextureFormat g_presentSourceOverrideFormat = wgpu::TextureFormat::Undefined;
+static std::array<float, 4> g_presentSourceOverrideEfbRect{};
 
 static wgpu::Adapter g_adapter;
 wgpu::Instance g_instance;
@@ -341,6 +349,90 @@ TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool m
   };
 }
 
+TextureWithSampler create_motion_vector_texture(uint32_t width, uint32_t height) {
+  const wgpu::Extent3D size{.width = std::max(width, 1u), .height = std::max(height, 1u), .depthOrArrayLayers = 1};
+  const wgpu::TextureDescriptor textureDescriptor{
+      .label = "Motion vectors",
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = size,
+      .format = wgpu::TextureFormat::RG16Float,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  auto texture = g_device.CreateTexture(&textureDescriptor);
+  auto view = texture.CreateView();
+  return {
+      .texture = std::move(texture),
+      .view = std::move(view),
+      .size = size,
+      .format = wgpu::TextureFormat::RG16Float,
+  };
+}
+
+TextureWithSampler create_motion_depth_texture(uint32_t width, uint32_t height) {
+  const wgpu::Extent3D size{.width = std::max(width, 1u), .height = std::max(height, 1u), .depthOrArrayLayers = 1};
+  const wgpu::TextureDescriptor textureDescriptor{
+      .label = "Motion vector depth",
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = size,
+      .format = wgpu::TextureFormat::RG32Float,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  auto texture = g_device.CreateTexture(&textureDescriptor);
+  auto view = texture.CreateView();
+  return {
+      .texture = std::move(texture),
+      .view = std::move(view),
+      .size = size,
+      .format = wgpu::TextureFormat::RG32Float,
+  };
+}
+
+TextureWithSampler create_motion_transparency_texture(uint32_t width, uint32_t height) {
+  const wgpu::Extent3D size{.width = std::max(width, 1u), .height = std::max(height, 1u), .depthOrArrayLayers = 1};
+  const wgpu::TextureDescriptor textureDescriptor{
+      .label = "Motion vector transparency",
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = size,
+      .format = wgpu::TextureFormat::RGBA16Float,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  auto texture = g_device.CreateTexture(&textureDescriptor);
+  auto view = texture.CreateView();
+  return {
+      .texture = std::move(texture),
+      .view = std::move(view),
+      .size = size,
+      .format = wgpu::TextureFormat::RGBA16Float,
+  };
+}
+
+TextureWithSampler create_motion_mark_texture(uint32_t width, uint32_t height) {
+  const wgpu::Extent3D size{.width = std::max(width, 1u), .height = std::max(height, 1u), .depthOrArrayLayers = 1};
+  const wgpu::TextureDescriptor textureDescriptor{
+      .label = "Motion vector mark",
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = size,
+      .format = wgpu::TextureFormat::R8Unorm,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  auto texture = g_device.CreateTexture(&textureDescriptor);
+  auto view = texture.CreateView();
+  return {
+      .texture = std::move(texture),
+      .view = std::move(view),
+      .size = size,
+      .format = wgpu::TextureFormat::R8Unorm,
+  };
+}
+
 const TextureWithSampler& present_source() noexcept {
   return g_graphicsConfig.msaaSamples > 1 ? g_frameBufferResolved : g_frameBuffer;
 }
@@ -352,6 +444,7 @@ PresentSource current_present_source() noexcept {
         .texture = g_presentSourceOverrideTexture,
         .size = g_presentSourceOverrideSize,
         .format = g_presentSourceOverrideFormat,
+        .efbRect = g_presentSourceOverrideEfbRect,
     };
   }
 
@@ -364,7 +457,8 @@ PresentSource current_present_source() noexcept {
 }
 
 void set_present_source_override(wgpu::BindGroup bindGroup, wgpu::Texture texture, wgpu::Extent3D size,
-                                 wgpu::TextureFormat format) noexcept {
+                                 wgpu::TextureFormat format, std::array<float, 4> efbRect) noexcept {
+  g_presentSourceOverrideEfbRect = efbRect;
   g_presentSourceOverrideBindGroup = std::move(bindGroup);
   g_presentSourceOverrideTexture = std::move(texture);
   g_presentSourceOverrideSize = size;
@@ -378,6 +472,7 @@ void clear_present_source_override() noexcept {
   g_presentSourceOverrideTexture = {};
   g_presentSourceOverrideSize = {};
   g_presentSourceOverrideFormat = wgpu::TextureFormat::Undefined;
+  g_presentSourceOverrideEfbRect = {};
 }
 
 Viewport calculate_present_viewport_for_aspect(uint32_t surface_width, uint32_t surface_height,
@@ -814,6 +909,11 @@ bool initialize(AuroraBackend auroraBackend) {
         implicitDeviceSynchronizationSupported = true;
         requiredFeatures.push_back(feature);
       }
+      // Motion vectors: alpha-blended surfaces own a pixel's depth only where they are mostly opaque (gx.cpp).
+      if (feature == wgpu::FeatureName::Float32Blendable) {
+        g_float32Blendable = true;
+        requiredFeatures.push_back(feature);
+      }
     }
     if (!implicitDeviceSynchronizationSupported) {
       Log.warn(
@@ -1102,6 +1202,10 @@ void shutdown() {
   g_frameBuffer = {};
   g_frameBufferResolved = {};
   g_depthBuffer = {};
+  g_motionVectors = {};
+  g_motionDepth = {};
+  g_motionMark = {};
+  g_motionTransparency = {};
   g_queue = {};
   g_surface = {};
   g_device = {};
@@ -1245,6 +1349,15 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, ui
   g_frameBuffer = create_render_texture(render_width, render_height, true);
   g_frameBufferResolved = create_render_texture(render_width, render_height, false);
   g_depthBuffer = create_depth_texture(render_width, render_height);
+  g_motionVectors = gfx::motion_vectors_active() ? create_motion_vector_texture(render_width, render_height)
+                                                 : TextureWithSampler{};
+  g_motionDepth = gfx::motion_vectors_active() ? create_motion_depth_texture(render_width, render_height)
+                                               : TextureWithSampler{};
+  g_motionMark = gfx::motion_vectors_active() ? create_motion_mark_texture(render_width, render_height)
+                                              : TextureWithSampler{};
+  g_motionTransparency = gfx::motion_vectors_active()
+                             ? create_motion_transparency_texture(render_width, render_height)
+                             : TextureWithSampler{};
   g_CopyBindGroup = create_copy_bind_group(present_source());
   // The mapped viewport/scissor bake in the old target's scale (gx.cpp): re-map them now.
   if (window::g_onRenderTargetResized != nullptr) {
