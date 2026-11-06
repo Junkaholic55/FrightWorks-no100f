@@ -662,6 +662,12 @@ struct FreeCam {
     float x = 0, y = 0, z = 0, yaw = 0, pitch = 0;  // yaw 0 looks along +z, pitch > 0 looks down
 };
 FreeCam g_cam;
+// "camspin DEG": the free camera turns this many degrees per frame (steady motion for testing motion vectors
+// and temporal upscalers; 0 stops).
+float g_camSpinDegrees = 0.0f;
+// "cammove DX DY DZ": the free camera moves this far per frame (world units; steady parallax for testing).
+float g_camMove[3] = {0.0f, 0.0f, 0.0f};
+
 uint32_t g_camScene = 0, g_camSceneId = 0;  // the scene the free camera belongs to
 
 void CamRows(const FreeCam& c, float rows[4][3]) {
@@ -737,6 +743,11 @@ void ApplySpotCam(const Spot& s) {
 void UpdateFreecam(bool menuFocused) {
     static SDL_Gamepad* pad = nullptr;
     if (!g_cam.on) return;
+    // Once per frame (the camera itself is updated several times per frame).
+    if (g_camSpinDegrees != 0.0f) g_cam.yaw += g_camSpinDegrees * 3.14159265f / 180.0f;
+    g_cam.x += g_camMove[0];
+    g_cam.y += g_camMove[1];
+    g_cam.z += g_camMove[2];
     if (pad && !SDL_GamepadConnected(pad)) {
         SDL_CloseGamepad(pad);
         pad = nullptr;
@@ -1399,6 +1410,11 @@ void DrawDiagnostics() {
 //   textures            log which suspect textures (devmenu_textures.txt) have been drawn in this level
 //   find ID|off         draw that suspect's texture solid magenta / back to normal
 //   freecam on|off      free camera (starts at the game camera)
+//   camspin DEG         free camera turns DEG degrees every frame (0 stops; turns the free camera on)
+//   cammove DX DY DZ    free camera moves this far every frame (world units; 0 0 0 stops)
+//   shot FILE           screenshot of the next presented frame (as F2, without the clipboard/notice)
+//   mvview MODE [SCALE] motion vectors view (AURORA_MOTION_VECTORS=1): 0 off, 1 motion only, 2 over the picture;
+//                       SCALE = pixels per frame for full color
 //   cam X Y Z YAW PITCH free camera at this pose (degrees; pitch > 0 looks down)
 //   cutscene            "cutscene yes|no control yes|no": recorded cutscene playing (devmenu_press.txt skips it), player
 //                       has control (no during cutscenes and in-world camera pans)
@@ -1538,6 +1554,39 @@ void PollCommandFile() {
                           st ? st->drawCallCount : 0u, st ? st->mergedDrawCallCount : 0u, t.framesPerSecond,
                           t.averageFrameTimeMs, t.p95FrameTimeMs, t.jitterMs);
             g_status = b;
+#ifdef AURORA_HAS_MOTION_VECTORS
+        } else if (cmd == "mvview") {
+            std::istringstream as(arg);
+            int mode = 0;
+            float scale = 0.0f;
+            if (as >> mode) {
+                as >> scale;
+                aurora_set_motion_vector_view(mode, scale);
+            }
+            g_status = std::string("motion vectors ") + (aurora_motion_vectors_active() ? "on" : "off (AURORA_MOTION_VECTORS=1)") +
+                       ", view " + std::to_string(aurora_get_motion_vector_view());
+#endif
+        } else if (cmd == "camspin") {
+            g_camSpinDegrees = arg.empty() ? 0.0f : static_cast<float>(std::atof(arg.c_str()));
+            if (g_camSpinDegrees != 0.0f && !g_cam.on) SetFreecam(true);
+            g_status = "camera spin " + std::to_string(g_camSpinDegrees) + " degrees per frame" +
+                       (g_cam.on ? "" : " (no free camera here)");
+        } else if (cmd == "cammove") {
+            std::istringstream as(arg);
+            float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+            as >> dx >> dy >> dz;
+            g_camMove[0] = dx;
+            g_camMove[1] = dy;
+            g_camMove[2] = dz;
+            if ((dx != 0.0f || dy != 0.0f || dz != 0.0f) && !g_cam.on) SetFreecam(true);
+            g_status = "camera move " + arg + " per frame";
+        } else if (cmd == "shot") {
+            if (arg.empty()) {
+                g_status = "shot FILE (.png or .bmp; relative to the working folder)";
+            } else {
+                aurora_request_screenshot(arg.c_str());
+                g_status = "Screenshot requested: " + arg;
+            }
         } else if (cmd == "freecam") {
             SetFreecam(arg == "on");
         } else if (cmd == "cam") {
@@ -1548,6 +1597,9 @@ void PollCommandFile() {
                 c.yaw *= 3.14159265f / 180.0f;
                 c.pitch *= 3.14159265f / 180.0f;
                 g_cam = c;
+                // The pose belongs to this scene (as with "freecam on"): ApplyFreecam turns it off elsewhere.
+                g_camScene = CurrentScenePtr();
+                g_camSceneId = CurrentSceneId();
                 g_status = "Free camera at " + arg;
             } else {
                 g_status = "cam X Y Z YAW PITCH";
@@ -1630,6 +1682,24 @@ void DrawStatus() {
         ImGui::TextDisabled("%.1f %.1f %.1f  yaw %.0f pitch %.0f", g_cam.x, g_cam.y, g_cam.z,
                             g_cam.yaw * 180.0f / 3.14159265f, g_cam.pitch * 180.0f / 3.14159265f);
     }
+#ifdef AURORA_HAS_MOTION_VECTORS
+    if (aurora_motion_vectors_active()) {
+        // Motion vectors are on (AURORA_MOTION_VECTORS=1): show them live instead of the picture.
+        static const char* const kViews[] = {"Off", "Motion only", "Over the picture"};
+        int view = aurora_get_motion_vector_view();
+        float scale = aurora_get_motion_vector_view_scale();
+        ImGui::SetNextItemWidth(OverlayTheme::Px(160.0f));
+        if (ImGui::Combo("Motion vectors view", &view, kViews, 3)) aurora_set_motion_vector_view(view, 0.0f);
+        if (view != 0) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(OverlayTheme::Px(120.0f));
+            if (ImGui::SliderFloat("px for full color", &scale, 1.0f, 64.0f, "%.0f")) aurora_set_motion_vector_view(view, scale);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Grey (or the picture) = still; hue = direction the surface came from, saturation = speed.\n"
+                              "Red: from the right, green-yellow: from below, cyan: from the left, blue-purple: from above.");
+    }
+#endif
     bool recordAudio = RuntimeConfigFile::RecordAudio();
     if (OverlayTheme::Toggle("Record audio (F3 videos)", &recordAudio)) RuntimeConfigFile::SetRecordAudio(recordAudio);
     if (ImGui::IsItemHovered())
@@ -2159,14 +2229,39 @@ void DrawCutoutToast() {
 
 // Button presses for scripts, also while a cutscene plays (devmenu.txt is read only in play): every 30 frames
 // "devmenu_press.txt" is read and deleted; each line "BUTTON[+BUTTON...] [FRAMES] [cutscene]" (a b x y z start up down
-// left right, default 10 frames) is held on pad 1 for that many frames, lines one after another. "cutscene": only if a
-// recorded cutscene is playing then (A skips it after a few seconds; in play A jumps). Logged to devmenu.log.
+// left right, and the control stick pushed all the way: sup sdown sleft sright, half way: hup hdown hleft hright; default
+// 10 frames) is held on pad 1 for that many frames, lines one after another. "cutscene": only if a recorded cutscene is
+// playing then (A skips it after a few seconds; in play A jumps). Logged to devmenu.log.
 struct Press {
     uint16_t buttons;
     int frames;
+    int8_t stickX = 0;
+    int8_t stickY = 0;
 };
 std::vector<Press> g_presses;
 int g_pressFrames = 0;  // frames the front press has been held
+
+// The stick part of a press line: true if every name is a button or a stick direction.
+bool PressStick(const std::string& names, int8_t& x, int8_t& y) {
+    static const std::map<std::string, std::pair<int, int>> kStick{
+        {"sup", {0, 1}}, {"sdown", {0, -1}}, {"sleft", {-1, 0}}, {"sright", {1, 0}},
+        {"hup", {0, 2}}, {"hdown", {0, -2}}, {"hleft", {-2, 0}}, {"hright", {2, 0}}};
+    int sx = 0, sy = 0;
+    std::istringstream ss(names);
+    for (std::string n; std::getline(ss, n, '+');) {
+        const auto it = kStick.find(Lower(n));
+        if (it == kStick.end()) continue;
+        const auto value = [](int v) { return v == 0 ? 0 : (std::abs(v) == 1 ? 110 : 55) * (v > 0 ? 1 : -1); };
+        if (it->second.first != 0) sx = value(it->second.first);
+        if (it->second.second != 0) sy = value(it->second.second);
+    }
+    x = static_cast<int8_t>(sx);
+    y = static_cast<int8_t>(sy);
+    return sx != 0 || sy != 0;
+}
+
+// PressBits' "valid line" bit for a line with only stick directions (no PAD_BUTTON_* uses it); masked off when held.
+constexpr uint16_t kStickOnly = 0x8000;
 
 uint16_t PressBits(const std::string& names) {
     static const std::map<std::string, uint16_t> kBits{
@@ -2174,13 +2269,21 @@ uint16_t PressBits(const std::string& names) {
         {"z", PAD_TRIGGER_Z},      {"start", PAD_BUTTON_START}, {"up", PAD_BUTTON_UP},     {"down", PAD_BUTTON_DOWN},
         {"left", PAD_BUTTON_LEFT}, {"right", PAD_BUTTON_RIGHT}};
     uint16_t bits = 0;
+    bool any = false;
     std::istringstream ss(names);
     for (std::string n; std::getline(ss, n, '+');) {
-        const auto it = kBits.find(Lower(n));
+        const std::string name = Lower(n);
+        if (name.size() > 1 && (name[0] == 's' || name[0] == 'h') &&
+            (name.substr(1) == "up" || name.substr(1) == "down" || name.substr(1) == "left" || name.substr(1) == "right")) {
+            any = true;  // a stick direction (PressStick)
+            continue;
+        }
+        const auto it = kBits.find(name);
         if (it == kBits.end()) return 0;
         bits |= it->second;
+        any = true;
     }
-    return bits;
+    return any ? (bits | kStickOnly) : 0;
 }
 
 void UpdatePresses() {
@@ -2197,7 +2300,9 @@ void UpdatePresses() {
                 ss >> frames >> when;
                 const uint16_t bits = PressBits(names);
                 const bool skip = when == "cutscene" && !CutscenePlaying();
-                if (bits && frames > 0 && !skip) g_presses.push_back({bits, frames});
+                Press press{static_cast<uint16_t>(bits & ~kStickOnly), frames};
+                PressStick(names, press.stickX, press.stickY);
+                if (bits && frames > 0 && !skip) g_presses.push_back(press);
                 log << "press " << l << " -> " << (!bits ? "unknown button" : skip ? "skipped (no cutscene)" : "queued") << "\n";
             }
             in.close();
@@ -2269,6 +2374,13 @@ void HandleSdlEvent(const SDL_Event& event) noexcept {
     // LB: not mapped on the default controller layouts (it is L on the NSO GameCube one)
     if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && event.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER && g_open)
         g_toggleFocus = true;
+}
+
+bool PressedStick(int8_t& x, int8_t& y) noexcept {
+    if (g_presses.empty() || g_pressFrames == 0) return false;
+    x = g_presses.front().stickX;
+    y = g_presses.front().stickY;
+    return x != 0 || y != 0;
 }
 
 uint16_t PressedButtons() noexcept {

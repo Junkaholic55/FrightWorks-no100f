@@ -24,4 +24,6 @@ bool BlocksInput() noexcept;
 void ApplyFreecam(uint32_t camera, CpuContext* ctx);
 // Pad 1 buttons (PAD_BUTTON_*) held by the "devmenu_press.txt" file command or the Skip button, ORed in by PADRead.
 uint16_t PressedButtons() noexcept;
+// Pad 1 control stick held by the same file command (sup/sdown/sleft/sright, hup/...); false when none.
+bool PressedStick(int8_t& x, int8_t& y) noexcept;
 } // namespace no100f_devmenu

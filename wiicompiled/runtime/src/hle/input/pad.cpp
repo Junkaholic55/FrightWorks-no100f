@@ -276,6 +276,11 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
         statuses[0].err = PAD_ERR_NONE;
         statuses[0].button |= pressed;
     }
+    if (int8_t x = 0, y = 0; no100f_devmenu::PressedStick(x, y)) {
+        statuses[0].err = PAD_ERR_NONE;
+        statuses[0].stickX = x;
+        statuses[0].stickY = y;
+    }
     if (uint16_t scripted = 0; WiiRemoteInput::ScriptedPadButtons(scripted)) {
         statuses[0].err = PAD_ERR_NONE;
         statuses[0].button |= scripted;
